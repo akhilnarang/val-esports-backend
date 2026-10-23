@@ -509,6 +509,24 @@ async def match_list(redis_client: Redis) -> list[schemas.Match]:
     )
 
 
+async def cached_match_list(redis_client: Redis) -> list[schemas.Match]:
+    """Read the VLR match listing from the cache, or else from VLR.
+
+    :param redis_client: A redis instance
+    :return: The listing, or an empty one when neither source can be read.
+    """
+    if raw := await redis_client.get("matches"):
+        try:
+            return schemas.MatchListAdapter.validate_json(raw)
+        except ValueError:
+            logger.warning("the cached VLR match listing is unreadable; fetching a fresh one")
+    try:
+        return await match_list(redis_client)
+    except Exception:
+        logger.warning("could not fetch the VLR match listing", exc_info=True)
+        return []
+
+
 async def with_broadcast_map(listed: list[schemas.Match], redis_client: Redis) -> list[schemas.ListedMatch]:
     """Attach the broadcast tracker's last known map score to the live match it follows.
 

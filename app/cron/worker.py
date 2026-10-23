@@ -51,7 +51,7 @@ class ArqWorker:
             cron_jobs.append(cron("app.cron.legacy_fcm.fcm_notification_cron", hour=None, minute={0, 15, 30, 45}))
         if settings.ENABLE_ID_MAPPING:
             cron_jobs.append(cron("app.cron.favorite_players.favorite_players_cron", hour=None, minute={10, 40}))
-        if settings.ENABLE_CACHE and settings.RIOT_API_KEY and settings.LLM_API_KEY:
+        if settings.RIOT_API_KEY:
             cron_jobs.append(
                 cron(
                     "app.cron.riot_matches.riot_matches_cron",
@@ -59,6 +59,12 @@ class ArqWorker:
                     minute={2, 7, 12, 17, 22, 27, 32, 37, 42, 47, 52, 57},
                 )
             )
+        if settings.RIOT_WEB_API_KEY:
+            # One minute after the matches cron, so the VLR listing this links against is fresh.
+            cron_jobs.append(
+                cron("app.cron.riot_web.riot_web_schedule_cron", hour=None, minute={1, 11, 21, 31, 41, 51})
+            )
+            cron_jobs.append(cron("app.cron.riot_web.riot_web_details_cron", hour=None, minute={4, 14, 24, 34, 44, 54}))
         if settings.ENABLE_LIVE_PUSH:
             # Every minute; the fixed job_id makes arq skip a run while the previous one is still going.
             cron_jobs.append(cron("app.cron.live_push.live_push_cron", second=0, job_id="live_push_cron"))
