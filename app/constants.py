@@ -49,6 +49,11 @@ TEST_TICK_KEY = "valesports:push:test_tick"
 PUSH_FETCH_FAILURE_LIMIT = 3
 PUSH_FETCH_FAILURES_KEY = "valesports:push:fetch_failures:{}"
 PUSH_FETCH_FAILURES_TTL = 600  # seconds; failures are consecutive per-minute runs
+# Riot's live list lingers ~11 minutes after a series, so it may explain a failed VLR read for
+# a few minutes past the last successful one before the normal fetch-failure path takes over.
+PUSH_RIOT_LIVE_GRACE_SECONDS = 300
+PUSH_RIOT_LIVE_SINCE_KEY = "valesports:push:riot_live_since:{}"  # when a match's failed reads began
+PUSH_RIOT_LIVE_SINCE_TTL = 3600  # outlives the grace, so an expired window cannot restart
 # The live push cron fetches the VLR listing only while a cached match is live or starts within this lead.
 PUSH_LISTING_LEAD = timedelta(minutes=15)
 VIDEO_SCORE_KEY = "valesports:tracker:score"
@@ -295,6 +300,108 @@ RIOT_RUN_BUDGET = timedelta(seconds=240)
 # Games turned down or contested are not asked about again while Riot still lists them.
 RIOT_REJECTED_KEY = "valesports:riot:rejected:{}"
 RIOT_REJECTED_TTL = timedelta(hours=13)
+
+
+class RiotMatchState(StrEnum):
+    """A Riot web series' own state."""
+
+    UNSTARTED = "unstarted"
+    IN_PROGRESS = "inProgress"
+    COMPLETED = "completed"
+
+
+RIOT_BRACKET_SECTION = "bracket"  # getStandings section type; group and crossGroup are tables
+RIOT_MATCH_ORIGIN = "match"  # getStandings origin type for a slot fed by another series
+RIOT_WIN_OUTCOME = "win"  # getStandings result outcome of the series winner
+RIOT_TBD_TEAM_ID = "0"  # getStandings team id of a slot not decided yet
+
+
+class RiotGameState(StrEnum):
+    """One Riot web game's own state; ``unneeded`` means the series ended before it was played."""
+
+    UNSTARTED = "unstarted"
+    IN_PROGRESS = "inProgress"
+    COMPLETED = "completed"
+    UNNEEDED = "unneeded"
+
+
+class VodProvider(StrEnum):
+    """A VOD's provider, as Riot names it."""
+
+    YOUTUBE = "youtube"
+    TWITCH = "twitch"
+    AFREECATV = "afreecatv"
+
+
+class BracketSourceKind(StrEnum):
+    """Where a bracket slot's participant comes from."""
+
+    MATCH = "match"
+    SEED = "seed"
+
+
+class BracketSourceResult(StrEnum):
+    """Which side of a feeding match a bracket slot receives."""
+
+    WINNER = "winner"
+    LOSER = "loser"
+
+
+class BracketStatus(StrEnum):
+    """What a bracket response's sections do and do not cover."""
+
+    OK = "ok"  # every mapped tournament answered
+    NO_BRACKET = "no_bracket"  # Riot answered, and no readable section belongs to this event
+    UNAVAILABLE = "unavailable"  # a mapping or fetch gap makes the answer unknown
+    STALE = "stale"  # sections returned, but a mapped tournament could not be read
+
+
+# Riot's watch-page service. ``sport=val`` is mandatory: without it Riot silently answers for another sport.
+RIOT_WEB_API_URL = "https://esports-api.service.valorantesports.com/persisted/val/"
+RIOT_WEB_PARAMS = {"hl": "en-US", "sport": "val"}
+RIOT_WEB_TIMEOUT = 10.0
+RIOT_WEB_LIVE_TIMEOUT = 5.0  # inside the minute live-push cron
+RIOT_WEB_REQUEST_TIMEOUT = 5.0  # on-demand standings fetch in the brackets route
+RIOT_WEB_SCHEDULE_MAX_PAGES = 5  # 80 events a page
+RIOT_WEB_SCHEDULE_LOOKBACK = timedelta(days=3)
+RIOT_WEB_LINK_WINDOW = timedelta(minutes=120)
+RIOT_WEB_LINK_FALLBACK_WINDOW = timedelta(minutes=360)  # only with exactly one candidate
+RIOT_WEB_DETAILS_BATCH = 30
+RIOT_WEB_DETAILS_REFRESH = timedelta(hours=1)  # completed matches gain VODs/locales for a while
+RIOT_WEB_DETAILS_SETTLE = timedelta(hours=48)  # after this a fetched match is never refetched
+RIOT_WEB_VODS_TIMEOUT = 1.0  # a match request waits at most this long for its stored VOD offsets
+RIOT_WEB_KEY_ALERTED_KEY = "valesports:riot_web:key_alerted"
+RIOT_WEB_KEY_ALERT_INTERVAL = 3600
+# VOD ids go into playback URLs, so only these shapes are accepted.
+YOUTUBE_VOD_ID_REGEX = r"^[A-Za-z0-9_-]{11}$"
+TWITCH_VOD_ID_REGEX = r"^\d{1,15}$"
+# Converted response; Riot's CDN caps at 60 s.
+RIOT_WEB_BRACKETS_KEY = "valesports:riot_web:brackets:{}"
+CACHE_TTL_RIOT_WEB_BRACKETS = 60
+RIOT_WEB_NAME_SUFFIXES = frozenset({"esports", "gaming", "clan"})
+# Riot display name -> VLR display names; a set, because Riot's "Fluxo" is two VLR teams.
+RIOT_WEB_TEAM_ALIASES: dict[str, frozenset[str]] = {
+    "KRÜ Visa": frozenset({"KRÜ Esports"}),
+    "Made In Brazil": frozenset({"MIBR GC"}),
+    "FENNEL HOTELAVA": frozenset({"FENNEL GC"}),
+    "Fusion": frozenset({"FUSION X"}),
+    "Bon Bon Bum Contra": frozenset({"Contra"}),
+    "Fluxo": frozenset({"LA MASIA", "Fluxo W7M"}),
+    "NAVI": frozenset({"Natus Vincere"}),
+    "VISA KRÜ Blaze": frozenset({"KRÜ BLAZE"}),
+    "Nos Sweat Blossom": frozenset({"No Sweat Blossom"}),
+    "Team Liquid VISA": frozenset({"Team Liquid Brazil"}),
+    "Dplus KIA": frozenset({"Dplus Esports"}),
+    "RED Canids Kalunga": frozenset({"RED Canids"}),
+    "YiJing": frozenset({"Yi-Jing"}),
+    "FULL SENSE SISU": frozenset({"sisu"}),
+    "Justice For Tomorrow": frozenset({"JFT GC"}),
+    "Keep Best Gaming": frozenset({"KeepBest Gaming"}),
+    "NAVI Junior": frozenset({"Natus Vincere Junior"}),
+    "Joblife GC": frozenset({"Joblife Nanas"}),
+    "KIWOOM DRX Academy": frozenset({"DRX Academy"}),
+    "T1 Esports Academy": frozenset({"T1 Academy"}),
+}
 
 
 class InsightKind(StrEnum):

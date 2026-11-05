@@ -1,3 +1,4 @@
+import asyncio
 import time
 
 from fastapi import APIRouter
@@ -5,7 +6,7 @@ from fastapi import APIRouter
 from app import cache, schemas
 from app.api import deps
 from app.core.config import settings
-from app.services import insights, matches
+from app.services import insights, match_vods, matches
 
 router = APIRouter()
 
@@ -23,4 +24,6 @@ async def get_matches(client: deps.RedisDep) -> list[schemas.ListedMatch]:
 async def get_match_by_id(id: deps.MatchId, client: deps.RedisDep) -> schemas.MatchDetailsResponse:
     deadline = time.monotonic() + settings.INSIGHTS_REQUEST_BUDGET_SECONDS
     details = await matches.cached_match_by_id(id, client)
-    return await insights.attach(id, details, deadline)
+    response, vods = await asyncio.gather(insights.attach(id, details, deadline), match_vods.map_vods(id, details))
+    response.map_vods = vods
+    return response
