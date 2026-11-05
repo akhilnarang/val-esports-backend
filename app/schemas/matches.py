@@ -43,6 +43,17 @@ class Event(BaseModel):
     patch: str | None = None
     status: str | None = None
 
+    @property
+    def game_changers(self) -> bool:
+        """Whether the event is a Game Changers competition.
+
+        VLR suffixes Game Changers rosters' tags (``M8GC``, ``MIBR.GC``, ``KRUB``) while the broadcast
+        shows the org's code (``M8``), so only these events match a code to a tag it starts.
+
+        :return: True for a Game Changers series.
+        """
+        return "game changers" in self.series.casefold()
+
     @computed_field  # type: ignore[prop-decorator]
     @property
     def status_label(self) -> str | None:
@@ -338,37 +349,44 @@ class VideoScore(BaseModel):
         except ValidationError:
             return None
 
-    def resolve_pair(self, teams: list[tuple[str, str | None]]) -> list[VideoTeam] | None:
-        """Resolve two VLR teams to the two broadcast entries one-to-one.
+    def resolve_pair(self, detail: MatchWithDetails) -> list[VideoTeam] | None:
+        """Resolve a match's two VLR teams to the two broadcast entries one-to-one.
 
         Each VLR team must match exactly one entry by name or tag, and neither team
         may take the other's entry. Evidence that fits both pairings is conflicting
         and rejected rather than guessed.
 
-        :param teams: Each VLR team's name and tag, in VLR order.
-        :return: The broadcast entries in the same order, or None when unmatched or ambiguous.
+        :param detail: Scraped match details.
+        :return: The broadcast entries in VLR order, or None when unmatched or ambiguous.
         """
-        if len(teams) != 2:
+        if len(detail.teams) != 2:
             return None
-        candidates = [self._candidates(name, tag) for name, tag in teams]
+        game_changers = detail.event.game_changers
+        candidates = [self._candidates(team.name, team.tag, game_changers) for team in detail.teams]
         pairings = [(first, second) for first in candidates[0] for second in candidates[1] if first != second]
         if len(pairings) != 1:
             return None
         first, second = pairings[0]
         return [self.teams[first], self.teams[second]]
 
-    def _candidates(self, name: str, tag: str | None) -> list[int]:
+    def _candidates(self, name: str, tag: str | None, game_changers: bool) -> list[int]:
         """List the broadcast entries matching one VLR team by name or tag.
 
         :param name: VLR team name.
         :param tag: VLR team tag, if available.
+        :param game_changers: Whether a tag may also match an entry code it starts (``M8GC`` for ``M8``).
         :return: Indices of the candidate entries.
         """
         name, tag = name.strip().casefold(), (tag or "").strip().casefold()
         return [
             index
             for index, team in enumerate(self.teams)
-            if team.name.strip().casefold() == name or (tag and team.code.strip().casefold() == tag)
+            if team.name.strip().casefold() == name
+            or (
+                tag
+                and (code := team.code.strip().casefold())
+                and (tag == code or (game_changers and tag.startswith(code)))
+            )
         ]
 
     def same_score(self, other: VideoScore) -> bool:

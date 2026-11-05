@@ -187,6 +187,8 @@ def _pause(video: VideoScore | None, current: PushCurrentMap | None) -> PushPaus
 def match_codes(detail: MatchWithDetails, codes: list[str]) -> bool:
     """Check whether candidate codes unambiguously match the two teams.
 
+    In a Game Changers event a code also matches a tag it starts (``M8`` for ``M8GC``).
+
     :param detail: Scraped match details.
     :param codes: Candidate team codes.
     :return: True if each code uniquely matches a distinct team.
@@ -196,11 +198,13 @@ def match_codes(detail: MatchWithDetails, codes: list[str]) -> bool:
     wanted = [code.strip().casefold() for code in codes]
     if not all(wanted) or wanted[0] == wanted[1]:
         return False
+    game_changers = detail.event.game_changers
     owners = [
         {
             index
             for index, team in enumerate(detail.teams)
             if code in {(value or "").strip().casefold() for value in (team.tag, team.name)} - {""}
+            or (game_changers and (team.tag or "").strip().casefold().startswith(code))
         }
         for code in wanted
     ]
@@ -216,7 +220,7 @@ def video_team_scores(detail: MatchWithDetails, video: VideoScore) -> dict[str, 
     """
     if len(detail.teams) != 2 or _map_with_number(detail, video.map_number) is None:
         return None
-    resolved = video.resolve_pair([(team.name, team.tag) for team in detail.teams])
+    resolved = video.resolve_pair(detail)
     if resolved is None:
         return None
     return {team.name.strip().casefold(): entry.score for team, entry in zip(detail.teams, resolved, strict=True)}
@@ -361,7 +365,7 @@ def order_teams_for_broadcast(detail: MatchWithDetails, video: VideoScore) -> No
     current = _current_map(detail, is_final(detail.event.status))
     if current is None or current.number != video.map_number:
         return
-    resolved = video.resolve_pair([(team.name, team.tag) for team in detail.teams])
+    resolved = video.resolve_pair(detail)
     if resolved is not None and [entry.side for entry in resolved] == [TeamSide.RED, TeamSide.BLUE]:
         detail.teams.reverse()
 

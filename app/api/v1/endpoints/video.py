@@ -51,7 +51,8 @@ async def video_context(client: RedisDep, codes: VideoContextCodes = "") -> Vide
         return VideoContext(
             match_id=match_id,
             map_order=push.ordered_map_names(detail),
-            teams=[team.tag or team.name for team in detail.teams],
+            # The tracker checks the answer against its own codes, which a GC tag only starts.
+            teams=[code.strip() for code in codes.split(",")],
         )
     video = await push.video_score(client)
     if video is None:
