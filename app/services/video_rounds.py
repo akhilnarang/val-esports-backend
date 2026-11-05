@@ -36,7 +36,7 @@ def _team_ids(detail: MatchWithDetails) -> dict[str, str]:
 
 def _advance(history: VideoRounds | None, video: VideoScore, detail: MatchWithDetails) -> VideoRounds | None:
     ids = _team_ids(detail)
-    pair = video.resolve_pair([(team.name, team.tag) for team in detail.teams])
+    pair = video.resolve_pair(detail)
     current_map = next((item for item in detail.data if item.number == video.map_number), None)
     if not ids or pair is None or current_map is None:
         return None

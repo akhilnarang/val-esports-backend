@@ -1462,14 +1462,14 @@ async def test_video_context_resolves_the_trackers_match(monkeypatch, tmp_path):
     token_file.write_text("tracker-token")
     monkeypatch.setattr(deps.settings, "VIDEO_TOKEN_FILE", str(token_file))
 
-    def cached(maps, status="live"):
+    def cached(maps, status="live", tags=("ALP", "BET"), series="Series"):
         return MatchWithDetails(
             teams=[
-                TeamWithImage(id="1", name="Alpha", tag="ALP", score=1, img="https://cdn.vlr.gg/a.png"),
-                TeamWithImage(id="2", name="Beta", tag="BET", score=0, img="https://cdn.vlr.gg/b.png"),
+                TeamWithImage(id="1", name="Alpha", tag=tags[0], score=1, img="https://cdn.vlr.gg/a.png"),
+                TeamWithImage(id="2", name="Beta", tag=tags[1], score=0, img="https://cdn.vlr.gg/b.png"),
             ],
             bans=[],
-            event=Event(id="99", img="https://cdn.vlr.gg/e.png", series="Series", stage="Stage", status=status),
+            event=Event(id="99", img="https://cdn.vlr.gg/e.png", series=series, stage="Stage", status=status),
             videos=MatchVideos(streams=[], vods=[]),
             map_count=len(maps),
             data=[MatchData(number=number, map=name, teams=[], members=[], rounds=[]) for number, name in maps],
@@ -1552,6 +1552,21 @@ async def test_video_context_resolves_the_trackers_match(monkeypatch, tmp_path):
         }
     )
     assert (await get_context("ALP,BET")).status_code == 404
+
+    # VLR suffixes Game Changers tags while the broadcast shows the org code. Both the tracker's
+    # context and its score must still find the match, and the answer must carry the tracker's
+    # own codes, or the tracker discards it (every GC Championship lookup 404'd this way).
+    redis.set.side_effect = None
+    suffixed = {"tags": ("M8GC", "MIBR.GC"), "maps": [(1, "Ascent"), (4, "Lotus")]}
+    # Outside Game Changers a code that only starts a tag is another roster.
+    videos[constants.PUSH_DETAILS_KEY] = json.dumps({"126": cached(**suffixed, series="VCT")})
+    assert (await get_context("M8,MIBR")).status_code == 404
+    videos[constants.PUSH_DETAILS_KEY] = json.dumps({"126": cached(**suffixed, series="Game Changers Championship")})
+    response = await get_context("M8,MIBR")
+    assert response.status_code == 200
+    assert (response.json()["match_id"], response.json()["teams"]) == ("126", ["M8", "MIBR"])
+    videos[constants.VIDEO_SCORE_KEY] = json.dumps(video(["M8", "MIBR"], [3, 1]))
+    assert (await get_context()).json()["match_id"] == "126"
 
 
 @pytest.mark.asyncio
