@@ -9,6 +9,7 @@ __pycache__
 *.rdb
 !app/locales/*.json
 !tests/fixtures/riot_web/*.json
+!tests/fixtures/riot/*.json
 db.sqlite3*
 backups/
 .s.PGSQL.*

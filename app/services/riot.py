@@ -26,7 +26,17 @@ from app.constants import (
 )
 from app.core.config import settings
 from app.db.models import RiotMatch
-from app.schemas.riot import Candidate, Game, GameLink, RecentGames, RiotGame, Side, VlrTeam
+from app.schemas.riot import (
+    Candidate,
+    ExtraMap,
+    Game,
+    GameLink,
+    MatchExtra,
+    RecentGames,
+    RiotGame,
+    Side,
+    VlrTeam,
+)
 from app.services import matches
 
 logger = logging.getLogger(__name__)
@@ -329,3 +339,92 @@ async def link(session: AsyncSession, game: Game, candidate: Candidate, verdict:
         .returning(RiotMatch.riot_id)
     )
     return result.first() is not None
+
+
+async def match_extra(session: AsyncSession, match_id: str) -> MatchExtra:
+    """Read the Riot games linked to a VLR match's maps.
+
+    :param session: Request session.
+    :param match_id: VLR match id.
+    :return: The linked maps in order; a match with no linked game has none.
+    """
+    rows = await session.scalars(
+        select(RiotMatch).where(RiotMatch.vlr_match_id == match_id).order_by(RiotMatch.map_number)
+    )
+    return MatchExtra(maps=[_extra_map(row) for row in rows])
+
+
+def _extra_map(row: RiotMatch) -> ExtraMap:
+    """Turn a linked Riot game into its VLR map's extra data.
+
+    :param row: The stored game; its link names each Riot side's VLR team slot.
+    :return: The map's players and rounds, with Riot's player IDs replaced by names.
+    """
+    data = row.data
+    info = data["matchInfo"]
+    link = GameLink.model_validate(row.link)
+    slots = {"Red": link.red_team, "Blue": link.blue_team}
+    players = [p for p in data["players"] if p["teamId"] in slots]
+    names = {p["puuid"]: p["gameName"] for p in players}
+
+    def name(puuid: str | None) -> str | None:
+        return names.get(puuid, puuid) if puuid else None
+
+    def item(value: str | None) -> str | None:
+        return value.lower() if value else None
+
+    return ExtraMap.model_validate(
+        {
+            "map_number": row.map_number,
+            "map": RIOT_MAP_NAMES.get(info["mapId"].rsplit("/", 1)[-1]),
+            "started_at": row.started_at,
+            "duration_millis": info["gameLengthMillis"],
+            "patch": info["gameVersion"],
+            "players": [
+                {"name": p["gameName"], "team": slots[p["teamId"]], "agent_id": p["characterId"], **p["stats"]}
+                for p in players
+            ],
+            "rounds": [
+                {
+                    "number": r["roundNum"] + 1,
+                    "winner": slots[r["winningTeam"]],
+                    "winner_role": r["winningTeamRole"],
+                    "result": r["roundResult"],
+                    "plant_site": r.get("plantSite") or None,
+                    "planter": name(r.get("bombPlanter")),
+                    "defuser": name(r.get("bombDefuser")),
+                    "kills": [
+                        {
+                            "killer": name(k["killer"]),
+                            "victim": name(k["victim"]),
+                            "assistants": [name(a) for a in k["assistants"]],
+                            "time_millis": k["timeSinceRoundStartMillis"],
+                            "damage_type": k["finishingDamage"]["damageType"],
+                            "damage_item": item(k["finishingDamage"]["damageItem"]),
+                        }
+                        for k in sorted(
+                            (k for s in r["playerStats"] for k in s["kills"]),
+                            key=lambda k: k["timeSinceRoundStartMillis"],
+                        )
+                    ],
+                    "players": [
+                        {
+                            "name": name(s["puuid"]),
+                            "score": s["score"],
+                            **{
+                                field: sum(d[field] for d in s["damage"])
+                                for field in ("damage", "headshots", "bodyshots", "legshots")
+                            },
+                            "loadout_value": s["economy"]["loadoutValue"],
+                            "spent": s["economy"]["spent"],
+                            "remaining": s["economy"]["remaining"],
+                            "weapon_id": item(s["economy"]["weapon"]),
+                            "armor_id": item(s["economy"]["armor"]),
+                        }
+                        for s in r["playerStats"]
+                    ],
+                }
+                for r in data["roundResults"]
+            ],
+        }
+    )
