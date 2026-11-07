@@ -6,7 +6,8 @@ from fastapi import APIRouter
 from app import cache, schemas
 from app.api import deps
 from app.core.config import settings
-from app.services import insights, match_vods, matches
+from app.schemas.riot import MatchExtra
+from app.services import insights, match_vods, matches, riot
 
 router = APIRouter()
 
@@ -27,3 +28,9 @@ async def get_match_by_id(id: deps.MatchId, client: deps.RedisDep) -> schemas.Ma
     response, vods = await asyncio.gather(insights.attach(id, details, deadline), match_vods.map_vods(id, details))
     response.map_vods = vods
     return response
+
+
+@router.get("/{id}/extra")
+async def get_match_extra(id: deps.MatchId, session: deps.DatabaseSessionDep) -> MatchExtra:
+    """Return round-by-round Riot data for the match's maps that are linked to Riot games."""
+    return await riot.match_extra(session, id)

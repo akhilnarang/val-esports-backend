@@ -101,3 +101,74 @@ class GameLink(BaseModel):
     same_game: bool
     confidence: float = Field(ge=0, le=1)
     reason: str
+
+
+class ExtraPlayer(BaseModel):
+    """One player's whole-map line from Riot; IDs are Riot's content UUIDs."""
+
+    name: str
+    team: VlrTeamSlot
+    agent_id: str
+    kills: int
+    deaths: int
+    assists: int
+    score: int
+
+
+class ExtraKill(BaseModel):
+    """One kill in a round, in the order it happened."""
+
+    killer: str
+    victim: str
+    assistants: list[str]
+    time_millis: int
+    damage_type: str
+    damage_item: str | None
+
+
+class ExtraRoundPlayer(BaseModel):
+    """One player's damage and buy in a round."""
+
+    name: str
+    score: int
+    damage: int
+    headshots: int
+    bodyshots: int
+    legshots: int
+    loadout_value: int
+    spent: int
+    remaining: int
+    weapon_id: str | None
+    armor_id: str | None
+
+
+class ExtraRound(BaseModel):
+    """One round of a map, numbered from 1."""
+
+    number: int
+    winner: VlrTeamSlot
+    winner_role: str
+    result: str
+    plant_site: str | None
+    planter: str | None
+    defuser: str | None
+    kills: list[ExtraKill]
+    players: list[ExtraRoundPlayer]
+
+
+class ExtraMap(BaseModel):
+    """A VLR map's Riot game, with sides named by VLR's team slots."""
+
+    map_number: int
+    map: str
+    started_at: datetime
+    duration_millis: int
+    patch: str
+    players: list[ExtraPlayer]
+    rounds: list[ExtraRound]
+
+
+class MatchExtra(BaseModel):
+    """What ``GET /api/v1/matches/{id}/extra`` returns: one entry per map linked to a Riot game."""
+
+    maps: list[ExtraMap]

@@ -19,6 +19,7 @@ Most endpoints are public. Some internal endpoints may require `X-API-Key` heade
 | GET | `/events/{id}/brackets` | Get Riot's bracket layout for an event |
 | GET | `/matches` | List matches with filtering options |
 | GET | `/matches/{id}` | Get detailed match information |
+| GET | `/matches/{id}/extra` | Get round-by-round Riot data for a match's maps |
 | GET | `/news` | Get latest news articles |
 | GET | `/news/{id}` | Get an article with ordered content blocks |
 | GET | `/player/{id}` | Get player statistics |
@@ -303,6 +304,18 @@ to the wrong map. VLR's own `videos.vods` are unchanged and remain in the same r
 `map_vods` is always present as an additive key, even when `RIOT_WEB_API_KEY` is unset,
 in which case it is `[]`. Making it unconditional is deliberate: clients get a stable
 shape instead of a key that appears and disappears with the key's presence.
+
+## Match extra data
+
+`GET /matches/{id}/extra` serves the Riot games archived for a match's maps (see
+[cron.md](cron.md)), kept out of `GET /matches/{id}` so that response stays light. It reads
+only the database: `{"maps": []}` until a map has been linked to a Riot game, which needs
+`RIOT_API_KEY` and `LLM_API_KEY` and happens after the map ends.
+
+Each player's `team` and each round's `winner` are VLR's `team1`/`team2` slots for that map.
+Rounds are numbered from 1 and kills are in the order they happened. Players are named by
+their Riot name, which carries the team tag (`VIT Derke`). Agent, weapon and armor IDs are
+Riot's lowercase content UUIDs, and a missing item is `null`. A map is about 75 KB.
 
 ## Match insights
 

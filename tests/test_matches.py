@@ -857,3 +857,51 @@ async def test_map_vods_are_absent_without_stored_riot_data(monkeypatch, make_da
     assert [(team.name, team.score) for team in disabled.teams] == [("100 Thieves", 1), ("Team Vitality", 3)]
     assert [str(vod.url) for vod in disabled.videos.vods] == ["https://youtu.be/MZjaOtjtRlU?t=1"]
     assert [item.number for item in disabled.data] == [1, 2, 3, 4]
+
+
+@pytest.mark.asyncio
+async def test_match_extra_serves_linked_riot_games_by_vlr_team(make_database):
+    """Riot's stored game for a VLR map comes back with VLR's team slots and player names, never Riot IDs."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.api.v1.endpoints.matches import get_match_extra
+    from app.db.migrations import upgrade_to_head
+    from app.db.models import RiotMatch
+    from app.schemas.riot import MatchExtra
+
+    database_url = make_database()
+    await upgrade_to_head(database_url)
+    sessions = async_sessionmaker(create_async_engine(database_url), expire_on_commit=False)
+    # A real Riot payload, trimmed to two rounds; Riot's Red side is VLR's team2 on this map.
+    data = json.loads((FIXTURE_DIR / "riot" / "game_754737_map3.json").read_text())
+    link = {"red_team": "team2", "blue_team": "team1", "same_game": True, "confidence": 0.99, "reason": "rosters"}
+    started = datetime(2026, 10, 18, tzinfo=UTC)
+    async with sessions.begin() as session:
+        session.add(
+            RiotMatch(riot_id="linked", vlr_match_id="754737", map_number=3, started_at=started, data=data, link=link)
+        )
+        session.add(RiotMatch(riot_id="unlinked", started_at=started, data=data))
+
+    async with sessions() as session:
+        extra = (await get_match_extra("754737", session)).model_dump(mode="json")
+        assert await get_match_extra("1", session) == MatchExtra(maps=[])
+    [game] = extra["maps"]
+    assert {key: game[key] for key in ("map_number", "map", "duration_millis")} == {
+        "map_number": 3,
+        "map": "Sunset",
+        "duration_millis": 2318352,
+    }
+    # Observers are not players, and each side is named by the VLR slot the link gave it.
+    assert len(game["players"]) == 10
+    derke = next(p for p in game["players"] if p["name"] == "VIT Derke")
+    assert (derke["team"], derke["kills"], derke["deaths"], derke["assists"]) == ("team2", 14, 12, 2)
+    first = game["rounds"][0]
+    assert (first["number"], first["winner"], first["plant_site"], first["planter"]) == (1, "team2", "B", "VIT PROFEK")
+    # Kills are in the order they happened, by name.
+    assert [(k["killer"], k["victim"]) for k in first["kills"][:2]] == [
+        ("LOUD tkzin", "VIT Jamppi"),
+        ("LOUD DaviH", "VIT Chronicle"),
+    ]
+    assert [k["time_millis"] for k in first["kills"]] == sorted(k["time_millis"] for k in first["kills"])
+    derke = next(p for p in first["players"] if p["name"] == "VIT Derke")
+    assert (derke["damage"], derke["loadout_value"], derke["armor_id"]) == (324, 600, None)
