@@ -315,7 +315,26 @@ only the database: `{"maps": []}` until a map has been linked to a Riot game, wh
 Each player's `team` and each round's `winner` are VLR's `team1`/`team2` slots for that map.
 Rounds are numbered from 1 and kills are in the order they happened. Players are named by
 their Riot name, which carries the team tag (`VIT Derke`). Agent, weapon and armor IDs are
-Riot's lowercase content UUIDs, and a missing item is `null`. A map is about 75 KB.
+Riot's lowercase content UUIDs, and a missing item is `null`. A map is about 150 KB, or
+17 KB gzipped.
+
+Riot records where players stand at each kill, plant and defuse, and nowhere in between.
+`/extra` places those spots on the map's radar image at `radar_url`:
+
+- `x` and `y` are fractions of the image's width and height from its top left corner.
+  `off_map` is `true` when either falls outside 0 to 1, as in Iso's Kill Contract arena or
+  after a fall past the map's edge.
+- `facing` is in radians on the image. 0 points right and π/2 points down.
+- Each kill has the victim's `victim_location` and `player_locations` for the living players,
+  without the victim. Each round has `plant` and `defuse`, each with `time_millis` from the
+  start of the round, `location` and `player_locations`, or `null` when it did not happen.
+  A location or list that Riot did not record is `null`.
+- `ceremony` is Riot's highlight for the round (`Clutch`, `Ace`, `TeamAce`, `Flawless`,
+  `Closer` or `Thrifty`), or `null`.
+
+The radars, the weapon kill-feed icons (`weapons.json`), and the agent markers and ability
+icons (`agents.json`) are on the CDN. `scripts/mirror_map_images.py`,
+`scripts/mirror_weapon_images.py` and `scripts/mirror_agent_images.py` make them.
 
 ## Match insights
 
