@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field
 from pydantic.alias_generators import to_camel
 
 VlrTeamSlot = Literal["team1", "team2"]
@@ -118,11 +118,16 @@ class ExtraPlayer(BaseModel):
 class ExtraLocation(BaseModel):
     """A spot on the map's radar, as fractions of its width and height from its top left corner.
 
-    A spot outside 0 to 1 is off the radar, such as Iso's Kill Contract arena or a fall past the map's edge.
+    ``off_map`` marks a spot outside the radar, such as Iso's Kill Contract arena or a fall past the map's edge.
     """
 
     x: float
     y: float
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def off_map(self) -> bool:
+        return not (0 <= self.x <= 1 and 0 <= self.y <= 1)
 
 
 class ExtraPlayerLocation(BaseModel):
