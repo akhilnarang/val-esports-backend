@@ -10,6 +10,9 @@ For each agent this saves, at original resolution:
 
 - `{key}-portrait.png`: the official 616x822 full portrait.
 - `{key}-icon.png`: the square head icon.
+- `{key}-{slot}.png`: each ability's icon, for kills Riot credits to an ability. `slot` is the kill's
+  `damage_item` in `/matches/{id}/extra` (`ability1`, `ability2`, `grenadeability`, `ultimate`), which
+  also keys the icon in the manifest.
 
 `key` is the lowercased alphanumeric agent name (`kayo` for KAY/O), matching
 how VLR labels agent images. An `agents.json` manifest records each file's
@@ -29,6 +32,8 @@ AGENTS_PAGE = "https://playvalorant.com/en-us/agents/"
 VALORANT_API_AGENTS = "https://valorant-api.com/v1/agents?isPlayableCharacter=true"
 DEFAULT_CDN_BASE_URL = "https://files.akhilnarang.dev/cdn/valorant/"
 DIMENSIONS = re.compile(r"-(\d+)x(\d+)\.\w+$")
+# Riot's match data calls the C ability GrenadeAbility; valorant-api.com calls that slot Grenade.
+RIOT_SLOTS = {"Ability1": "ability1", "Ability2": "ability2", "Grenade": "grenadeability", "Ultimate": "ultimate"}
 
 
 def png_dimensions(content: bytes) -> tuple[int, int]:
@@ -55,7 +60,7 @@ def key(name: str) -> str:
 
 
 def main() -> None:
-    """Download each agent's portrait and icon into the output directory.
+    """Download each agent's portrait, icon, and ability icons into the output directory.
 
     :return: None.
     """
@@ -78,10 +83,19 @@ def main() -> None:
                 "width": item["media"]["dimensions"]["width"],
                 "height": item["media"]["dimensions"]["height"],
             }
+        agents = client.get(VALORANT_API_AGENTS).raise_for_status().json()["data"]
         icons = {
             key(a["displayName"]): {"name": a["displayName"], "url": a["displayIcon"], "uuid": a["uuid"]}
-            for a in client.get(VALORANT_API_AGENTS).raise_for_status().json()["data"]
+            for a in agents
             if a.get("displayIcon")
+        }
+        abilities = {
+            key(a["displayName"]): {
+                RIOT_SLOTS[ability["slot"]]: (ability["displayName"], ability["displayIcon"])
+                for ability in a["abilities"]
+                if ability["slot"] in RIOT_SLOTS and ability.get("displayIcon")
+            }
+            for a in agents
         }
         manifest = {}
         for agent_key, portrait in sorted(portraits.items()):
@@ -104,6 +118,22 @@ def main() -> None:
                     "width": width,
                     "height": height,
                     "upstream_source": url,
+                }
+            entry["abilities"] = {}
+            for slot, (name, url) in abilities[agent_key].items():
+                path = output / f"{agent_key}-{slot}.png"
+                content = client.get(url).raise_for_status().content
+                path.write_bytes(content)
+                width, height = png_dimensions(content)
+                entry["abilities"][slot] = {
+                    "name": name,
+                    "icon": {
+                        "url": f"{cdn_base_url.rstrip('/')}/{path.name}",
+                        "file": path.name,
+                        "width": width,
+                        "height": height,
+                        "upstream_source": url,
+                    },
                 }
             manifest[agent_key] = entry
             print(f"{agent_key}: portrait {entry['portrait']['width']}px, icon saved")
