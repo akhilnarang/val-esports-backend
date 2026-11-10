@@ -1678,7 +1678,7 @@ async def test_riot_matches_cron_archives_games_then_links_them_when_a_vlr_map_a
         "replay": game("Jam", 13, 9, 140),
         "still-live": game("Ascent", 13, 11, 180),
         "aborted": game("Triad", 5, 5, 200),
-        # A codename RIOT_MAP_NAMES lacks is archived without a link, not dropped.
+        # A codename RIOT_MAPS lacks is archived without a link, not dropped.
         "unknown-map": game("Void", 13, 3, 220),
         # Missing a side's teams leaves nothing to link, but the completed game is still archived.
         "no-sides": {

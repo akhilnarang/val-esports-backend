@@ -19,7 +19,7 @@ from app.constants import (
     RIOT_LINK_LOOKBACK,
     RIOT_LINK_MIN_CONFIDENCE,
     RIOT_LINK_MODEL_TIMEOUT,
-    RIOT_MAP_NAMES,
+    RIOT_MAPS,
     RIOT_MATCH_API_URL,
     RIOT_REJECTED_KEY,
     RIOT_REJECTED_TTL,
@@ -103,9 +103,9 @@ def parse_game(riot_id: str, data: dict) -> Game | None:
     if not payload.match_info.is_completed or not payload.round_results:
         return None
     asset = payload.match_info.map_id.rsplit("/", 1)[-1]
-    map_name = RIOT_MAP_NAMES.get(asset)
-    if map_name is None:
-        logger.warning("Riot game %s is on map %s, which RIOT_MAP_NAMES lacks", riot_id, asset)
+    riot_map = RIOT_MAPS.get(asset)
+    if riot_map is None:
+        logger.warning("Riot game %s is on map %s, which RIOT_MAPS lacks", riot_id, asset)
     rounds_won = {team.team_id: team.rounds_won for team in payload.teams}
     sides = {
         side: Side(
@@ -117,7 +117,7 @@ def parse_game(riot_id: str, data: dict) -> Game | None:
     }
     return Game(
         riot_id=riot_id,
-        map=map_name,
+        map=riot_map.name if riot_map else None,
         started_at=datetime.fromtimestamp(payload.match_info.game_start_millis / 1000, UTC),
         red=sides.get("Red"),
         blue=sides.get("Blue"),
@@ -376,7 +376,7 @@ def _extra_map(row: RiotMatch) -> ExtraMap:
     return ExtraMap.model_validate(
         {
             "map_number": row.map_number,
-            "map": RIOT_MAP_NAMES.get(info["mapId"].rsplit("/", 1)[-1]),
+            "map": RIOT_MAPS[info["mapId"].rsplit("/", 1)[-1]].name,
             "started_at": row.started_at,
             "duration_millis": info["gameLengthMillis"],
             "patch": info["gameVersion"],
