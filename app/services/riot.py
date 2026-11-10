@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 from collections.abc import Iterator
 from datetime import UTC, datetime
 
@@ -358,10 +359,12 @@ def _extra_map(row: RiotMatch) -> ExtraMap:
     """Turn a linked Riot game into its VLR map's extra data.
 
     :param row: The stored game; its link names each Riot side's VLR team slot.
-    :return: The map's players and rounds, with Riot's player IDs replaced by names.
+    :return: The map's players and rounds, with Riot's player IDs replaced by names and game locations placed on
+        the map's radar. Riot records locations at each kill, plant and defuse; any it left out come back None.
     """
     data = row.data
     info = data["matchInfo"]
+    riot_map = RIOT_MAPS[info["mapId"].rsplit("/", 1)[-1]]
     link = GameLink.model_validate(row.link)
     slots = {"Red": link.red_team, "Blue": link.blue_team}
     players = [p for p in data["players"] if p["teamId"] in slots]
@@ -373,10 +376,43 @@ def _extra_map(row: RiotMatch) -> ExtraMap:
     def item(value: str | None) -> str | None:
         return value.lower() if value else None
 
+    def ceremony(value: str | None) -> str | None:
+        return None if not value or value == "CeremonyDefault" else value.removeprefix("Ceremony")
+
+    def radar(location: dict) -> dict:
+        return {
+            "x": round(location["y"] * riot_map.x_multiplier + riot_map.x_scalar, 3),
+            "y": round(location["x"] * riot_map.y_multiplier + riot_map.y_scalar, 3),
+        }
+
+    def facing(view_radians: float) -> float:
+        across = math.sin(view_radians) * riot_map.x_multiplier
+        down = math.cos(view_radians) * riot_map.y_multiplier
+        return round(math.atan2(down, across), 2)
+
+    def standing(locations: list[dict] | None) -> list[dict] | None:
+        if locations is None:
+            return None
+        return [
+            {"name": names[p["puuid"]], "location": radar(p["location"]), "facing": facing(p["viewRadians"])}
+            for p in locations
+            if p["puuid"] in names
+        ]
+
+    def spike(time: int | None, location: dict | None, locations: list[dict] | None) -> dict | None:
+        if time is None:
+            return None
+        return {
+            "time_millis": time,
+            "location": radar(location) if location else None,
+            "player_locations": standing(locations),
+        }
+
     return ExtraMap.model_validate(
         {
             "map_number": row.map_number,
-            "map": RIOT_MAPS[info["mapId"].rsplit("/", 1)[-1]].name,
+            "map": riot_map.name,
+            "radar_url": riot_map.radar_url,
             "started_at": row.started_at,
             "duration_millis": info["gameLengthMillis"],
             "patch": info["gameVersion"],
@@ -390,9 +426,16 @@ def _extra_map(row: RiotMatch) -> ExtraMap:
                     "winner": slots[r["winningTeam"]],
                     "winner_role": r["winningTeamRole"],
                     "result": r["roundResult"],
+                    "ceremony": ceremony(r.get("roundCeremony")),
                     "plant_site": r.get("plantSite") or None,
                     "planter": name(r.get("bombPlanter")),
                     "defuser": name(r.get("bombDefuser")),
+                    "plant": spike(r.get("plantRoundTime"), r.get("plantLocation"), r.get("plantPlayerLocations"))
+                    if r.get("bombPlanter")
+                    else None,
+                    "defuse": spike(r.get("defuseRoundTime"), r.get("defuseLocation"), r.get("defusePlayerLocations"))
+                    if r.get("bombDefuser")
+                    else None,
                     "kills": [
                         {
                             "killer": name(k["killer"]),
@@ -401,6 +444,8 @@ def _extra_map(row: RiotMatch) -> ExtraMap:
                             "time_millis": k["timeSinceRoundStartMillis"],
                             "damage_type": k["finishingDamage"]["damageType"],
                             "damage_item": item(k["finishingDamage"]["damageItem"]),
+                            "victim_location": radar(k["victimLocation"]) if k.get("victimLocation") else None,
+                            "player_locations": standing(k.get("playerLocations")),
                         }
                         for k in sorted(
                             (k for s in r["playerStats"] for k in s["kills"]),

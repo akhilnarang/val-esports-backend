@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -861,7 +862,7 @@ async def test_map_vods_are_absent_without_stored_riot_data(monkeypatch, make_da
 
 @pytest.mark.asyncio
 async def test_match_extra_serves_linked_riot_games_by_vlr_team(make_database):
-    """Riot's stored game for a VLR map comes back with VLR's team slots and player names, never Riot IDs."""
+    """Riot's stored game for a VLR map comes back with VLR's team slots, player names and radar locations."""
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     from app.api.v1.endpoints.matches import get_match_extra
@@ -874,6 +875,21 @@ async def test_match_extra_serves_linked_riot_games_by_vlr_team(make_database):
     sessions = async_sessionmaker(create_async_engine(database_url), expire_on_commit=False)
     # A real Riot payload, trimmed to two rounds; Riot's Red side is VLR's team2 on this map.
     data = json.loads((FIXTURE_DIR / "riot" / "game_754737_map3.json").read_text())
+    # Riot's locations, added to the first round: tkzin stands at the game origin, facing Jamppi at the kill.
+    opening = data["roundResults"][0]
+    kill = min((k for s in opening["playerStats"] for k in s["kills"]), key=lambda k: k["timeSinceRoundStartMillis"])
+    kill["victimLocation"] = {"x": -1000, "y": 2000}
+    kill["playerLocations"] = [
+        {"puuid": kill["killer"], "viewRadians": math.atan2(2000, -1000), "location": {"x": 0, "y": 0}}
+    ]
+    opening |= {
+        "roundCeremony": "CeremonyClutch",
+        "plantRoundTime": 45000,
+        "plantLocation": {"x": -1000, "y": 2000},
+        "plantPlayerLocations": [
+            {"puuid": opening["bombPlanter"], "viewRadians": 0.0, "location": {"x": -1000, "y": 2000}}
+        ],
+    }
     link = {"red_team": "team2", "blue_team": "team1", "same_game": True, "confidence": 0.99, "reason": "rosters"}
     started = datetime(2026, 10, 18, tzinfo=UTC)
     async with sessions.begin() as session:
@@ -905,3 +921,20 @@ async def test_match_extra_serves_linked_riot_games_by_vlr_team(make_database):
     assert [k["time_millis"] for k in first["kills"]] == sorted(k["time_millis"] for k in first["kills"])
     derke = next(p for p in first["players"] if p["name"] == "VIT Derke")
     assert (derke["damage"], derke["loadout_value"], derke["armor_id"]) == (324, 600, None)
+    assert game["radar_url"] == "https://files.akhilnarang.dev/cdn/valorant/sunset-radar.webp"
+    opening_kill = first["kills"][0]
+    assert opening_kill["victim_location"] == {"x": 0.656, "y": 0.594}
+    [tkzin] = opening_kill["player_locations"]
+    assert (tkzin["name"], tkzin["location"]) == ("LOUD tkzin", {"x": 0.5, "y": 0.516})
+    assert tkzin["facing"] == pytest.approx(math.atan2(0.594 - 0.516, 0.656 - 0.5), abs=0.01)
+    assert first["ceremony"] == "Clutch"
+    assert first["plant"] == {
+        "time_millis": 45000,
+        "location": {"x": 0.656, "y": 0.594},
+        "player_locations": [{"name": "VIT PROFEK", "location": {"x": 0.656, "y": 0.594}, "facing": -1.57}],
+    }
+    assert first["defuse"] is None
+    # A round stored without Riot's locations still comes back, with them None.
+    second = game["rounds"][1]
+    assert (second["ceremony"], second["plant"], second["planter"]) == (None, None, "VIT Sayonara")
+    assert (second["kills"][0]["victim_location"], second["kills"][0]["player_locations"]) == (None, None)
