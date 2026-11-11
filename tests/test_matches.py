@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -861,7 +862,7 @@ async def test_map_vods_are_absent_without_stored_riot_data(monkeypatch, make_da
 
 @pytest.mark.asyncio
 async def test_match_extra_serves_linked_riot_games_by_vlr_team(make_database):
-    """Riot's stored game for a VLR map comes back with VLR's team slots and player names, never Riot IDs."""
+    """Riot's stored game for a VLR map comes back with VLR's team slots, player names and radar locations."""
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     from app.api.v1.endpoints.matches import get_match_extra
@@ -905,3 +906,22 @@ async def test_match_extra_serves_linked_riot_games_by_vlr_team(make_database):
     assert [k["time_millis"] for k in first["kills"]] == sorted(k["time_millis"] for k in first["kills"])
     derke = next(p for p in first["players"] if p["name"] == "VIT Derke")
     assert (derke["damage"], derke["loadout_value"], derke["armor_id"]) == (324, 600, None)
+    assert game["radar_url"] == "https://files.akhilnarang.dev/cdn/valorant/sunset-radar.webp"
+    # The opening kill: everyone alive stands on the radar, the victim apart, and the killer faces the victim.
+    opening = first["kills"][0]
+    assert opening["victim_location"] == {"x": 0.164, "y": 0.476}
+    standing = {p["name"]: p for p in opening["player_locations"]}
+    assert len(standing) == 9 and opening["victim"] not in standing
+    assert all(0 <= p["location"]["x"] <= 1 and 0 <= p["location"]["y"] <= 1 for p in standing.values())
+    killer = standing[opening["killer"]]
+    towards = math.atan2(
+        opening["victim_location"]["y"] - killer["location"]["y"],
+        opening["victim_location"]["x"] - killer["location"]["x"],
+    )
+    assert killer["facing"] == pytest.approx(towards, abs=0.02)
+    # Riot's default ceremony is no highlight; the planter stands on the plant spot, and no defuse happened.
+    assert first["ceremony"] is None
+    assert (first["plant"]["time_millis"], first["plant"]["location"]) == (43877, {"x": 0.06, "y": 0.385})
+    planter = next(p for p in first["plant"]["player_locations"] if p["name"] == first["planter"])
+    assert planter["location"] == first["plant"]["location"]
+    assert first["defuse"] is None

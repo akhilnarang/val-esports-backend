@@ -115,8 +115,30 @@ class ExtraPlayer(BaseModel):
     score: int
 
 
+class ExtraLocation(BaseModel):
+    """A spot on the map's radar, as fractions of its width and height from its top left corner.
+
+    A value outside 0 to 1 is off the radar, such as Iso's Kill Contract arena or a fall past the map's edge.
+    """
+
+    x: float
+    y: float
+
+
+class ExtraPlayerLocation(BaseModel):
+    """Where a player stood at one moment of a round, facing ``facing`` radians on the radar (0 right, π/2 down)."""
+
+    name: str
+    location: ExtraLocation
+    facing: float
+
+
 class ExtraKill(BaseModel):
-    """One kill in a round, in the order it happened."""
+    """One kill in a round, in the order it happened.
+
+    ``player_locations`` is where Riot placed the living as it landed, without the victim, who fell at
+    ``victim_location``, which is None when Riot recorded none.
+    """
 
     killer: str
     victim: str
@@ -124,6 +146,16 @@ class ExtraKill(BaseModel):
     time_millis: int
     damage_type: str
     damage_item: str | None
+    victim_location: ExtraLocation | None
+    player_locations: list[ExtraPlayerLocation]
+
+
+class ExtraSpike(BaseModel):
+    """A plant or defuse: when it finished, where (None when Riot recorded none), and where Riot placed the living."""
+
+    time_millis: int
+    location: ExtraLocation | None
+    player_locations: list[ExtraPlayerLocation]
 
 
 class ExtraRoundPlayer(BaseModel):
@@ -143,24 +175,31 @@ class ExtraRoundPlayer(BaseModel):
 
 
 class ExtraRound(BaseModel):
-    """One round of a map, numbered from 1."""
+    """One round of a map, numbered from 1.
+
+    ``ceremony`` is Riot's highlight for it (Clutch, Ace, TeamAce, Flawless, Closer or Thrifty), or None.
+    """
 
     number: int
     winner: VlrTeamSlot
     winner_role: str
     result: str
+    ceremony: str | None
     plant_site: str | None
     planter: str | None
     defuser: str | None
+    plant: ExtraSpike | None
+    defuse: ExtraSpike | None
     kills: list[ExtraKill]
     players: list[ExtraRoundPlayer]
 
 
 class ExtraMap(BaseModel):
-    """A VLR map's Riot game, with sides named by VLR's team slots."""
+    """A VLR map's Riot game, with sides named by VLR's team slots and every location on the radar at ``radar_url``."""
 
     map_number: int
     map: str
+    radar_url: str
     started_at: datetime
     duration_millis: int
     patch: str

@@ -1,5 +1,6 @@
 from datetime import timedelta
 from enum import StrEnum
+from typing import NamedTuple
 
 PREFIX = "https://www.vlr.gg"
 
@@ -275,21 +276,46 @@ MATCH_TIMEZONE = "America/New_York"
 
 PREDICTION_TIMEOUT_SECONDS = 2.0  # a slower prediction service answer falls back to Elo
 RIOT_MATCH_API_URL = "https://esports.api.riotgames.com/val/match/v1/"
-# From Riot's val-content-v1.
-RIOT_MAP_NAMES = {
-    "Ascent": "Ascent",
-    "Bonsai": "Split",
-    "Canyon": "Fracture",
-    "Duality": "Bind",
-    "Foxtrot": "Breeze",
-    "Infinity": "Abyss",
-    "Jam": "Lotus",
-    "Juliett": "Sunset",
-    "Pitt": "Pearl",
-    "Plummet": "Summit",
-    "Port": "Icebox",
-    "Rook": "Corrode",
-    "Triad": "Haven",
+VALORANT_CDN_URL = "https://files.akhilnarang.dev/cdn/valorant/"
+
+
+class RiotMap(NamedTuple):
+    """A map, and where its game coordinates fall on its radar.
+
+    The radar is the minimap ``scripts/mirror_map_images.py`` mirrors from valorant-api.com, and the multipliers
+    are valorant-api.com's for it: game ``y`` runs across the radar and game ``x`` up it.
+    """
+
+    name: str
+    x_multiplier: float
+    y_multiplier: float
+    x_scalar: float
+    y_scalar: float
+
+    @property
+    def radar_url(self) -> str:
+        """Find the map's radar on our CDN.
+
+        :return: The radar's URL.
+        """
+        return f"{VALORANT_CDN_URL}{self.name.lower()}-radar.webp"
+
+
+# Keyed by the codename in Riot's mapId, from Riot's val-content-v1.
+RIOT_MAPS = {
+    "Ascent": RiotMap("Ascent", 7e-05, -7e-05, 0.813895, 0.573242),
+    "Bonsai": RiotMap("Split", 7.8e-05, -7.8e-05, 0.842188, 0.697578),
+    "Canyon": RiotMap("Fracture", 7.8e-05, -7.8e-05, 0.556952, 1.155886),
+    "Duality": RiotMap("Bind", 5.9e-05, -5.9e-05, 0.576941, 0.967566),
+    "Foxtrot": RiotMap("Breeze", 7e-05, -7e-05, 0.465123, 0.833078),
+    "Infinity": RiotMap("Abyss", 8.1e-05, -8.1e-05, 0.5, 0.5),
+    "Jam": RiotMap("Lotus", 7.2e-05, -7.2e-05, 0.454789, 0.917752),
+    "Juliett": RiotMap("Sunset", 7.8e-05, -7.8e-05, 0.5, 0.515625),
+    "Pitt": RiotMap("Pearl", 7.8e-05, -7.8e-05, 0.480469, 0.916016),
+    "Plummet": RiotMap("Summit", 7.5e-05, -7.5e-05, 0.047401, 0.978891),
+    "Port": RiotMap("Icebox", 7.2e-05, -7.2e-05, 0.460214, 0.304687),
+    "Rook": RiotMap("Corrode", 7e-05, -7e-05, 0.526158, 0.5),
+    "Triad": RiotMap("Haven", 7.5e-05, -7.5e-05, 1.09345, 0.642728),
 }
 RIOT_LINK_LOOKBACK = timedelta(hours=8)
 RIOT_LINK_LEAD = timedelta(minutes=30)

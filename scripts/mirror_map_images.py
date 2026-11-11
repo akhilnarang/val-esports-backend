@@ -7,6 +7,9 @@ For each map on https://playvalorant.com/en-us/maps/ this saves, at original res
 - `{map}-splash.jpg`: the loading-screen art, which identifies a map at a glance, no wider than
   `SPLASH_WIDTH` px. playvalorant.com doesn't carry it, so it comes from valorant-api.com's `splash`
   (itself sourced from Riot game data), matched by map name.
+- `{map}-radar.webp`: the in-game minimap from valorant-api.com's `displayIcon`, lossless with its transparency.
+  `app.constants.RIOT_MAPS` places Riot's game coordinates on it with valorant-api.com's multipliers for that
+  image, so update both from the same valorant-api.com release.
 
 A `manifest.json` records each file's source URL and dimensions. Rerun when Riot adds a map.
 
@@ -102,17 +105,17 @@ def pick(urls: list[str]) -> tuple[str, str]:
     return minimap, max(wide, key=lambda url: sizes[url][0])
 
 
-def splash_urls(client: httpx2.Client) -> dict[str, str]:
-    """Find each map's loading-screen art on valorant-api.com.
+def valorant_api_maps(client: httpx2.Client) -> dict[str, dict]:
+    """Find each playable map on valorant-api.com.
 
     :param client: HTTP client.
-    :return: Splash URLs keyed by lowercase map name letters, the form of the maps page slugs.
+    :return: Map entries keyed by lowercase map name letters, the form of the maps page slugs.
     """
     maps = client.get(VALORANT_API_MAPS).raise_for_status().json()["data"]
     return {
-        re.sub(r"[^a-z]+", "", entry["displayName"].lower()): entry["splash"]
+        re.sub(r"[^a-z]+", "", entry["displayName"].lower()): entry
         for entry in maps
-        if entry.get("splash") and entry.get("tacticalDescription")
+        if entry.get("tacticalDescription")
     }
 
 
@@ -130,8 +133,21 @@ def save_splash(client: httpx2.Client, url: str, path: Path) -> tuple[int, int]:
     return image.size
 
 
+def save_radar(client: httpx2.Client, url: str, path: Path) -> tuple[int, int]:
+    """Download a radar and save it as a lossless WebP.
+
+    :param client: HTTP client.
+    :param url: Source PNG URL.
+    :param path: Output file.
+    :return: Saved width and height.
+    """
+    image = Image.open(io.BytesIO(client.get(url).raise_for_status().content)).convert("RGBA")
+    image.save(path, "WEBP", lossless=True, method=6)
+    return image.size
+
+
 def main() -> None:
-    """Download each map's minimap, banner, and splash into the output directory.
+    """Download each map's minimap, banner, splash, and radar into the output directory.
 
     :return: None.
     """
@@ -143,7 +159,7 @@ def main() -> None:
         if not (next_data := re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', page, re.DOTALL)):
             raise SystemExit(f"no page data found on {MAPS_PAGE}")
         data = json.loads(next_data[1])
-        splashes = splash_urls(client)
+        api_maps = valorant_api_maps(client)
         manifest = {}
         for block in map_blocks(data):
             slug = block["fragmentId"]
@@ -160,7 +176,8 @@ def main() -> None:
                     "height": height,
                     "upstream_source": url,
                 }
-            if splash := splashes.get(slug):
+            api_map = api_maps.get(slug, {})
+            if splash := api_map.get("splash"):
                 path = output / f"{slug}-splash.jpg"
                 width, height = save_splash(client, splash, path)
                 manifest[slug]["splash"] = {
@@ -172,6 +189,18 @@ def main() -> None:
                 }
             else:
                 print(f"{slug}: no splash on valorant-api.com")
+            if radar := api_map.get("displayIcon"):
+                path = output / f"{slug}-radar.webp"
+                width, height = save_radar(client, radar, path)
+                manifest[slug]["radar"] = {
+                    "url": f"{cdn_base_url.rstrip('/')}/{path.name}",
+                    "file": path.name,
+                    "width": width,
+                    "height": height,
+                    "upstream_source": radar,
+                }
+            else:
+                print(f"{slug}: no radar on valorant-api.com")
             print(f"{slug}: minimap {manifest[slug]['minimap']['width']}px, banner {banner.rsplit('-', 1)[-1]}")
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(f"{len(manifest)} maps -> {output}")

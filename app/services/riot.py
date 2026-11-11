@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 from collections.abc import Iterator
 from datetime import UTC, datetime
 
@@ -19,7 +20,7 @@ from app.constants import (
     RIOT_LINK_LOOKBACK,
     RIOT_LINK_MIN_CONFIDENCE,
     RIOT_LINK_MODEL_TIMEOUT,
-    RIOT_MAP_NAMES,
+    RIOT_MAPS,
     RIOT_MATCH_API_URL,
     RIOT_REJECTED_KEY,
     RIOT_REJECTED_TTL,
@@ -103,9 +104,9 @@ def parse_game(riot_id: str, data: dict) -> Game | None:
     if not payload.match_info.is_completed or not payload.round_results:
         return None
     asset = payload.match_info.map_id.rsplit("/", 1)[-1]
-    map_name = RIOT_MAP_NAMES.get(asset)
-    if map_name is None:
-        logger.warning("Riot game %s is on map %s, which RIOT_MAP_NAMES lacks", riot_id, asset)
+    riot_map = RIOT_MAPS.get(asset)
+    if riot_map is None:
+        logger.warning("Riot game %s is on map %s, which RIOT_MAPS lacks", riot_id, asset)
     rounds_won = {team.team_id: team.rounds_won for team in payload.teams}
     sides = {
         side: Side(
@@ -117,7 +118,7 @@ def parse_game(riot_id: str, data: dict) -> Game | None:
     }
     return Game(
         riot_id=riot_id,
-        map=map_name,
+        map=riot_map.name if riot_map else None,
         started_at=datetime.fromtimestamp(payload.match_info.game_start_millis / 1000, UTC),
         red=sides.get("Red"),
         blue=sides.get("Blue"),
@@ -358,10 +359,12 @@ def _extra_map(row: RiotMatch) -> ExtraMap:
     """Turn a linked Riot game into its VLR map's extra data.
 
     :param row: The stored game; its link names each Riot side's VLR team slot.
-    :return: The map's players and rounds, with Riot's player IDs replaced by names.
+    :return: The map's players and rounds, with Riot's player IDs replaced by names and game locations placed on
+        the map's radar. Riot records locations at each kill, plant and defuse; any it left out come back None.
     """
     data = row.data
     info = data["matchInfo"]
+    riot_map = RIOT_MAPS[info["mapId"].rsplit("/", 1)[-1]]
     link = GameLink.model_validate(row.link)
     slots = {"Red": link.red_team, "Blue": link.blue_team}
     players = [p for p in data["players"] if p["teamId"] in slots]
@@ -373,10 +376,41 @@ def _extra_map(row: RiotMatch) -> ExtraMap:
     def item(value: str | None) -> str | None:
         return value.lower() if value else None
 
+    def ceremony(value: str | None) -> str | None:
+        return None if not value or value == "CeremonyDefault" else value.removeprefix("Ceremony")
+
+    def radar(location: dict) -> dict:
+        return {
+            "x": round(location["y"] * riot_map.x_multiplier + riot_map.x_scalar, 3),
+            "y": round(location["x"] * riot_map.y_multiplier + riot_map.y_scalar, 3),
+        }
+
+    def facing(view_radians: float) -> float:
+        across = math.sin(view_radians) * riot_map.x_multiplier
+        down = math.cos(view_radians) * riot_map.y_multiplier
+        return round(math.atan2(down, across), 2)
+
+    def standing(locations: list[dict] | None) -> list[dict]:
+        return [
+            {"name": names[p["puuid"]], "location": radar(p["location"]), "facing": facing(p["viewRadians"])}
+            for p in locations or []
+            if p["puuid"] in names
+        ]
+
+    def spike(time: int | None, location: dict | None, locations: list[dict] | None) -> dict | None:
+        if time is None:
+            return None
+        return {
+            "time_millis": time,
+            "location": radar(location) if location else None,
+            "player_locations": standing(locations),
+        }
+
     return ExtraMap.model_validate(
         {
             "map_number": row.map_number,
-            "map": RIOT_MAP_NAMES.get(info["mapId"].rsplit("/", 1)[-1]),
+            "map": riot_map.name,
+            "radar_url": riot_map.radar_url,
             "started_at": row.started_at,
             "duration_millis": info["gameLengthMillis"],
             "patch": info["gameVersion"],
@@ -390,9 +424,16 @@ def _extra_map(row: RiotMatch) -> ExtraMap:
                     "winner": slots[r["winningTeam"]],
                     "winner_role": r["winningTeamRole"],
                     "result": r["roundResult"],
+                    "ceremony": ceremony(r.get("roundCeremony")),
                     "plant_site": r.get("plantSite") or None,
                     "planter": name(r.get("bombPlanter")),
                     "defuser": name(r.get("bombDefuser")),
+                    "plant": spike(r.get("plantRoundTime"), r.get("plantLocation"), r.get("plantPlayerLocations"))
+                    if r.get("bombPlanter")
+                    else None,
+                    "defuse": spike(r.get("defuseRoundTime"), r.get("defuseLocation"), r.get("defusePlayerLocations"))
+                    if r.get("bombDefuser")
+                    else None,
                     "kills": [
                         {
                             "killer": name(k["killer"]),
@@ -401,6 +442,8 @@ def _extra_map(row: RiotMatch) -> ExtraMap:
                             "time_millis": k["timeSinceRoundStartMillis"],
                             "damage_type": k["finishingDamage"]["damageType"],
                             "damage_item": item(k["finishingDamage"]["damageItem"]),
+                            "victim_location": radar(k["victimLocation"]) if k.get("victimLocation") else None,
+                            "player_locations": standing(k.get("playerLocations")),
                         }
                         for k in sorted(
                             (k for s in r["playerStats"] for k in s["kills"]),
