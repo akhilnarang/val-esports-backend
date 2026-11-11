@@ -137,7 +137,7 @@ def main() -> None:
                         "upstream_source": url,
                     }
             entry["abilities"] = {}
-            for slot, (name, url) in abilities[agent_key].items():
+            for slot, (name, url) in abilities.get(agent_key, {}).items():
                 path = output / f"{agent_key}-{slot}.png"
                 content = client.get(url).raise_for_status().content
                 path.write_bytes(content)

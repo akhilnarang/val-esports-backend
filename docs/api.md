@@ -321,14 +321,14 @@ Riot's lowercase content UUIDs, and a missing item is `null`. A map is about 150
 Riot records where players stand at each kill, plant and defuse, and nowhere in between.
 `/extra` places those spots on the map's radar image at `radar_url`:
 
-- `x` and `y` are fractions of the image's width and height from its top left corner.
-  `off_map` is `true` when either falls outside 0 to 1, as in Iso's Kill Contract arena or
-  after a fall past the map's edge.
+- `x` and `y` are fractions of the image's width and height from its top left corner. A value
+  outside 0 to 1 is off the radar, as in Iso's Kill Contract arena or after a fall past the
+  map's edge.
 - `facing` is in radians on the image. 0 points right and π/2 points down.
 - Each kill has the victim's `victim_location` and `player_locations` for the living players,
   without the victim. Each round has `plant` and `defuse`, each with `time_millis` from the
   start of the round, `location` and `player_locations`, or `null` when it did not happen.
-  A location or list that Riot did not record is `null`.
+  A location Riot did not record is `null`, and a list it did not record is empty.
 - `ceremony` is Riot's highlight for the round (`Clutch`, `Ace`, `TeamAce`, `Flawless`,
   `Closer` or `Thrifty`), or `null`.
 

@@ -875,24 +875,6 @@ async def test_match_extra_serves_linked_riot_games_by_vlr_team(make_database):
     sessions = async_sessionmaker(create_async_engine(database_url), expire_on_commit=False)
     # A real Riot payload, trimmed to two rounds; Riot's Red side is VLR's team2 on this map.
     data = json.loads((FIXTURE_DIR / "riot" / "game_754737_map3.json").read_text())
-    # Riot's locations, added to the first round: tkzin stands at the game origin, facing Jamppi at the kill,
-    # and Derke stands in Iso's Kill Contract arena, far below the map.
-    opening = data["roundResults"][0]
-    kill = min((k for s in opening["playerStats"] for k in s["kills"]), key=lambda k: k["timeSinceRoundStartMillis"])
-    derke_id = next(p["puuid"] for p in data["players"] if p["gameName"] == "VIT Derke")
-    kill["victimLocation"] = {"x": -1000, "y": 2000}
-    kill["playerLocations"] = [
-        {"puuid": kill["killer"], "viewRadians": math.atan2(2000, -1000), "location": {"x": 0, "y": 0}},
-        {"puuid": derke_id, "viewRadians": 0.0, "location": {"x": -50000, "y": 0}},
-    ]
-    opening |= {
-        "roundCeremony": "CeremonyClutch",
-        "plantRoundTime": 45000,
-        "plantLocation": {"x": -1000, "y": 2000},
-        "plantPlayerLocations": [
-            {"puuid": opening["bombPlanter"], "viewRadians": 0.0, "location": {"x": -1000, "y": 2000}}
-        ],
-    }
     link = {"red_team": "team2", "blue_team": "team1", "same_game": True, "confidence": 0.99, "reason": "rosters"}
     started = datetime(2026, 10, 18, tzinfo=UTC)
     async with sessions.begin() as session:
@@ -925,22 +907,21 @@ async def test_match_extra_serves_linked_riot_games_by_vlr_team(make_database):
     derke = next(p for p in first["players"] if p["name"] == "VIT Derke")
     assert (derke["damage"], derke["loadout_value"], derke["armor_id"]) == (324, 600, None)
     assert game["radar_url"] == "https://files.akhilnarang.dev/cdn/valorant/sunset-radar.webp"
-    opening_kill = first["kills"][0]
-    assert opening_kill["victim_location"] == {"x": 0.656, "y": 0.594, "off_map": False}
-    [tkzin, derke] = opening_kill["player_locations"]
-    assert (tkzin["name"], tkzin["location"]) == ("LOUD tkzin", {"x": 0.5, "y": 0.516, "off_map": False})
-    assert (derke["name"], derke["location"]) == ("VIT Derke", {"x": 0.5, "y": 4.416, "off_map": True})
-    assert tkzin["facing"] == pytest.approx(math.atan2(0.594 - 0.516, 0.656 - 0.5), abs=0.01)
-    assert first["ceremony"] == "Clutch"
-    assert first["plant"] == {
-        "time_millis": 45000,
-        "location": {"x": 0.656, "y": 0.594, "off_map": False},
-        "player_locations": [
-            {"name": "VIT PROFEK", "location": {"x": 0.656, "y": 0.594, "off_map": False}, "facing": -1.57}
-        ],
-    }
+    # The opening kill: everyone alive stands on the radar, the victim apart, and the killer faces the victim.
+    opening = first["kills"][0]
+    assert opening["victim_location"] == {"x": 0.164, "y": 0.476}
+    standing = {p["name"]: p for p in opening["player_locations"]}
+    assert len(standing) == 9 and opening["victim"] not in standing
+    assert all(0 <= p["location"]["x"] <= 1 and 0 <= p["location"]["y"] <= 1 for p in standing.values())
+    killer = standing[opening["killer"]]
+    towards = math.atan2(
+        opening["victim_location"]["y"] - killer["location"]["y"],
+        opening["victim_location"]["x"] - killer["location"]["x"],
+    )
+    assert killer["facing"] == pytest.approx(towards, abs=0.02)
+    # Riot's default ceremony is no highlight; the planter stands on the plant spot, and no defuse happened.
+    assert first["ceremony"] is None
+    assert (first["plant"]["time_millis"], first["plant"]["location"]) == (43877, {"x": 0.06, "y": 0.385})
+    planter = next(p for p in first["plant"]["player_locations"] if p["name"] == first["planter"])
+    assert planter["location"] == first["plant"]["location"]
     assert first["defuse"] is None
-    # A round stored without Riot's locations still comes back, with them None.
-    second = game["rounds"][1]
-    assert (second["ceremony"], second["plant"], second["planter"]) == (None, None, "VIT Sayonara")
-    assert (second["kills"][0]["victim_location"], second["kills"][0]["player_locations"]) == (None, None)

@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 VlrTeamSlot = Literal["team1", "team2"]
@@ -118,16 +118,11 @@ class ExtraPlayer(BaseModel):
 class ExtraLocation(BaseModel):
     """A spot on the map's radar, as fractions of its width and height from its top left corner.
 
-    ``off_map`` marks a spot outside the radar, such as Iso's Kill Contract arena or a fall past the map's edge.
+    A value outside 0 to 1 is off the radar, such as Iso's Kill Contract arena or a fall past the map's edge.
     """
 
     x: float
     y: float
-
-    @computed_field  # type: ignore[prop-decorator]
-    @property
-    def off_map(self) -> bool:
-        return not (0 <= self.x <= 1 and 0 <= self.y <= 1)
 
 
 class ExtraPlayerLocation(BaseModel):
@@ -142,7 +137,7 @@ class ExtraKill(BaseModel):
     """One kill in a round, in the order it happened.
 
     ``player_locations`` is where Riot placed the living as it landed, without the victim, who fell at
-    ``victim_location``. Either is None when Riot recorded none.
+    ``victim_location``, which is None when Riot recorded none.
     """
 
     killer: str
@@ -152,15 +147,15 @@ class ExtraKill(BaseModel):
     damage_type: str
     damage_item: str | None
     victim_location: ExtraLocation | None
-    player_locations: list[ExtraPlayerLocation] | None
+    player_locations: list[ExtraPlayerLocation]
 
 
 class ExtraSpike(BaseModel):
-    """A plant or defuse: when it finished, where, and where Riot placed the living; None where Riot recorded none."""
+    """A plant or defuse: when it finished, where (None when Riot recorded none), and where Riot placed the living."""
 
     time_millis: int
     location: ExtraLocation | None
-    player_locations: list[ExtraPlayerLocation] | None
+    player_locations: list[ExtraPlayerLocation]
 
 
 class ExtraRoundPlayer(BaseModel):

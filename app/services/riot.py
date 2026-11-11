@@ -390,12 +390,10 @@ def _extra_map(row: RiotMatch) -> ExtraMap:
         down = math.cos(view_radians) * riot_map.y_multiplier
         return round(math.atan2(down, across), 2)
 
-    def standing(locations: list[dict] | None) -> list[dict] | None:
-        if locations is None:
-            return None
+    def standing(locations: list[dict] | None) -> list[dict]:
         return [
             {"name": names[p["puuid"]], "location": radar(p["location"]), "facing": facing(p["viewRadians"])}
-            for p in locations
+            for p in locations or []
             if p["puuid"] in names
         ]
 
