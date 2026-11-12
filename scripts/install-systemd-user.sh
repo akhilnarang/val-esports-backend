@@ -1,14 +1,14 @@
 #!/bin/sh
-# Install the vlrgg-scraper systemd user unit (one-time per host).
+# Install the val-esports-backend systemd user unit (one-time per host).
 #
-# Copies deploy/systemd/vlrgg-scraper.service into the user unit directory,
+# Copies deploy/systemd/val-esports-backend.service into the user unit directory,
 # syncs the venv, and enables it. A running service with an unchanged unit is
 # reloaded (new worker, same socket); otherwise it is restarted.
 # Stop any independently managed process using gunicorn.sock before installation.
 set -eu
 
 root=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
-unit_name=vlrgg-scraper.service
+unit_name=val-esports-backend.service
 unit_src=$root/deploy/systemd/$unit_name
 unit_dir=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
 
