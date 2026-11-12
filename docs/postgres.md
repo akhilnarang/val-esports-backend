@@ -24,17 +24,17 @@ sudo systemctl mask postgresql postgresql@18-main
 sudo sed -i 's/^#\?\s*create_main_cluster\s*=.*/create_main_cluster = false/' /etc/postgresql-common/createcluster.conf
 
 /usr/lib/postgresql/18/bin/initdb -D ~/pgdata --auth-local=peer --auth-host=scram-sha-256 -E UTF8 --locale=C.UTF-8
-printf "listen_addresses = ''\nunix_socket_directories = '%s'\n" ~/vlrgg-scraper >> ~/pgdata/postgresql.conf
+printf "listen_addresses = ''\nunix_socket_directories = '%s'\n" ~/val-esports-backend >> ~/pgdata/postgresql.conf
 install -m 0644 deploy/systemd/postgres.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now postgres
-createdb -h ~/vlrgg-scraper vlrgg
+createdb -h ~/val-esports-backend vlrgg
 ```
 
-Add `export PGHOST=~/vlrgg-scraper` to the shell profile so `psql`, `pg_dump` and
+Add `export PGHOST=~/val-esports-backend` to the shell profile so `psql`, `pg_dump` and
 `createdb` find the socket. The app needs the socket in its URL, in `.env`:
 
 ```sh
-DATABASE_URL=postgresql+asyncpg:///vlrgg?host=/home/<user>/vlrgg-scraper
+DATABASE_URL=postgresql+asyncpg:///vlrgg?host=/home/<user>/val-esports-backend
 ```
 
 Startup runs the Alembic migrations, so the app creates its own tables.
@@ -50,12 +50,12 @@ the copy would be lost and the copy needs empty tables. The copy runs in one
 transaction, so a failure leaves PostgreSQL empty and you can run it again.
 
 ```sh
-systemctl --user stop vlrgg-scraper
+systemctl --user stop val-esports-backend
 git pull && uv sync
 # add DATABASE_URL to .env (Server setup) first; the copy reads it too
 uv run python -m scripts.sqlite_to_postgres db.sqlite3   # prints each table's row count
 psql vlrgg   # run the contributor GRANTs below, now that the tables exist
-systemctl --user start vlrgg-scraper
+systemctl --user start val-esports-backend
 ```
 
 To roll back, stop the app, check out the previous release, delete the
@@ -107,7 +107,7 @@ and in `/etc/nginx/streams-enabled/vlrgg-postgres.conf`, with the host's
 ```nginx
 server {
 	listen <tailscale-ip>:5432;
-	proxy_pass unix:/home/<user>/vlrgg-scraper/.s.PGSQL.5432;
+	proxy_pass unix:/home/<user>/val-esports-backend/.s.PGSQL.5432;
 }
 ```
 

@@ -1,4 +1,4 @@
-# VLR.gg Scraper
+# Val Esports Backend
 
 An unofficial FastAPI-based scraper for [vlr.gg](https://www.vlr.gg), providing Valorant esports data in a machine-readable JSON format.
 
@@ -40,7 +40,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Clone and install dependencies
 git clone <repo-url>
-cd vlrgg-scraper
+cd val-esports-backend
 uv sync
 ```
 
@@ -91,10 +91,10 @@ and read-only access for contributors.
 
 ```bash
 # Build image
-docker build -t vlrgg-scraper .
+docker build -t val-esports-backend .
 
 # Run container
-docker run -p 8000:8000 vlrgg-scraper
+docker run -p 8000:8000 val-esports-backend
 ```
 
 ### Production

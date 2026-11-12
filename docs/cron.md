@@ -119,7 +119,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -H "x-api-key: $KEY" \
 ```
 
 (a valid key prints `200`; a rejected one prints `403`), then set `RIOT_WEB_API_KEY` in
-`~/vlrgg-scraper/.env` and restart the service. Removing `RIOT_WEB_API_KEY` disables
+`~/val-esports-backend/.env` and restart the service. Removing `RIOT_WEB_API_KEY` disables
 the jobs and leaves every Riot-web field empty, and VLR responses are unaffected.
 
 ## Riot esports match archive

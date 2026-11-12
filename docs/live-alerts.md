@@ -22,12 +22,12 @@ and no alert existed for it; the second row above closes that gap.
 
 ## Where the signals land
 
-- **Sentry**: the production DSN in `~/vlrgg-scraper/.env` on server02 points at Sentry SaaS
+- **Sentry**: the production DSN in `~/val-esports-backend/.env` on server02 points at Sentry SaaS
   org `o1353375`, project id `6635298`. The app initialises the SDK in
   `app/core/observability.py::init_sentry`; `app/main.py` calls it at import. The systemd unit
   does not override `SENTRY_DSN`, so removing it from `.env` silences Sentry (the journal keeps
   the records).
-- **Journal**: `journalctl --user -u vlrgg-scraper | grep "video tracker"` on server02.
+- **Journal**: `journalctl --user -u val-esports-backend | grep "video tracker"` on server02.
 - No email, Slack, PagerDuty, or SMS destination is configured in this repository. Those live
   in Sentry issue alert rules and org integrations outside the repo.
 
@@ -67,9 +67,9 @@ on server02 or the development machine, so alert rules could not be read through
 5. Name and save the rule, then prove it with a synthetic event from server02:
 
    ```sh
-   cd ~/vlrgg-scraper && .venv/bin/python - <<'PY'
+   cd ~/val-esports-backend && .venv/bin/python - <<'PY'
    import logging, sys, time
-   sys.path.insert(0, "/home/ubuntu/vlrgg-scraper")
+   sys.path.insert(0, "/home/ubuntu/val-esports-backend")
    from app.core import observability
    from sentry_sdk import get_client
 

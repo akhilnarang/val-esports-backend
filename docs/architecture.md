@@ -106,7 +106,7 @@ Dynamic model creation and configuration.
 
 ## Deployment
 
-Production runs as a systemd user service (`deploy/systemd/vlrgg-scraper.service`),
+Production runs as a systemd user service (`deploy/systemd/val-esports-backend.service`),
 installed by `scripts/install-systemd-user.sh` and updated by `scripts/deploy.sh`. A
 `Dockerfile` is also available.
 
