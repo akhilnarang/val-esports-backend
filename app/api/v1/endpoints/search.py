@@ -2,7 +2,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query
 
-from app import schemas, constants
+from app import constants, schemas
 from app.services import search
 
 router = APIRouter()

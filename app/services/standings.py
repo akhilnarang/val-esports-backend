@@ -1,12 +1,11 @@
 import http
 
 from bs4 import BeautifulSoup
-from app.exceptions import ScrapingError
 from pydantic import HttpUrl
 
-from app import schemas, utils
-import app.constants as constants
+from app import constants, schemas, utils
 from app.core.connections import get_http_client
+from app.exceptions import ScrapingError
 
 
 async def standings_list(year: int) -> schemas.Standings:

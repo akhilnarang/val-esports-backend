@@ -1,11 +1,10 @@
 import http
 
 from bs4 import BeautifulSoup, Tag
-from app.exceptions import ScrapingError
 
-from app import schemas, utils
-import app.constants as constants
+from app import constants, schemas, utils
 from app.core.connections import get_http_client
+from app.exceptions import ScrapingError
 
 
 async def get_data(search_category: constants.SearchCategory, search_term: str) -> list[schemas.SearchResult]:
@@ -43,7 +42,7 @@ def parse_result(result_data: Tag) -> schemas.SearchResult:
     elif "series" in url:
         category = constants.SearchCategory.SERIES
     else:
-        raise Exception("Unknown category")
+        raise ScrapingError(f"Unknown search result category: {url}", url=url)
 
     if description := result_data.find("div", class_="search-item-desc"):
         description = utils.clean_string(description.text.strip())

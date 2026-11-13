@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel
@@ -10,6 +11,8 @@ from app.agent.prompt import SYSTEM_PROMPT
 from app.agent.tools import build_tools
 from app.core.config import settings
 from app.schemas import AskResponse
+
+logger = logging.getLogger(__name__)
 
 
 def _to_json(result) -> str:
@@ -33,8 +36,8 @@ async def _dispatch_one(dispatch, name, raw_args, trace):
     try:
         args = json.loads(raw_args or "{}")
         if not isinstance(args, dict):
-            raise ValueError("tool arguments must be a JSON object")
-    except (json.JSONDecodeError, ValueError) as e:
+            raise TypeError("tool arguments must be a JSON object")
+    except (json.JSONDecodeError, TypeError) as e:
         if trace is not None:
             trace.append({"tool": name, "args": raw_args, "error": "bad_arguments"})
         return _to_json({"error": f"malformed arguments: {e}"})
@@ -46,6 +49,7 @@ async def _dispatch_one(dispatch, name, raw_args, trace):
     try:
         return _to_json(await fn(**args))
     except Exception as e:  # tool failure fed back to the model, not a 500
+        logger.warning("ask tool %s failed", name, exc_info=True)
         return _to_json({"error": f"{type(e).__name__}: {e}"})
 
 
@@ -77,18 +81,22 @@ async def run_ask(query: str, redis_client, client=None) -> AskResponse:
             input_list.append({"type": "function_call", "call_id": o.call_id, "name": o.name, "arguments": o.arguments})
         # honour the total budget: run calls up to the remaining allowance, deny the overflow
         allowed = fcs[: max(0, budget - calls_used)]
-        denied = fcs[len(allowed):]
+        denied = fcs[len(allowed) :]
         # pass raw argument strings; _dispatch_one parses inside its try so malformed JSON can't 500
-        results = await asyncio.gather(*[
-            _dispatch_one(dispatch, fc.name, fc.arguments, trace) for fc in allowed])
+        results = await asyncio.gather(*[_dispatch_one(dispatch, fc.name, fc.arguments, trace) for fc in allowed])
         calls_used += len(allowed)
         for fc, content in zip(allowed, results):
             input_list.append({"type": "function_call_output", "call_id": fc.call_id, "output": content})
         for fc in denied:
             if trace is not None:
                 trace.append({"tool": fc.name, "args": fc.arguments, "denied": "budget"})
-            input_list.append({"type": "function_call_output", "call_id": fc.call_id,
-                               "output": _to_json({"error": "tool-call budget exhausted; answer with the data you have"})})
+            input_list.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": fc.call_id,
+                    "output": _to_json({"error": "tool-call budget exhausted; answer with the data you have"}),
+                }
+            )
 
     if settings.LLM_DEBUG:
         return AskResponse(answer=answer, tools_used=trace, model=model)

@@ -4,13 +4,11 @@ import http
 import dateutil.parser
 from bs4 import BeautifulSoup, Tag
 from bs4.element import ResultSet
-from app.exceptions import ScrapingError
 
-from app import schemas, utils, cache
-import app.constants as constants
+from app import cache, constants, schemas, utils
 from app.core.connections import get_http_client
+from app.exceptions import ScrapingError
 from app.utils import clean_number_string, expand_url, get_image_url, is_twitter_url, twitter_profile_url
-
 
 # VLR returns 50 match-history cards per page. When fetching "all" pages we request
 # them in batches of this size and stop as soon as a page yields no cards.
@@ -186,9 +184,7 @@ def parse_player_matches(content: bytes) -> list[dict]:
     return [parse_player_match(match) for match in soup.find_all("a", class_="wf-card fc-flex m-item")]
 
 
-async def fetch_additional_player_matches(
-    client, id: str, pages: int, seen: set[str] | None = None
-) -> list[dict]:
+async def fetch_additional_player_matches(client, id: str, pages: int, seen: set[str] | None = None) -> list[dict]:
     """
     Fetch match-history pages beyond page 1, preserving order (page 2, then 3, ...).
 
