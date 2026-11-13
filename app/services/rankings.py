@@ -4,11 +4,10 @@ import os
 from concurrent.futures import ProcessPoolExecutor
 
 from bs4 import BeautifulSoup
-from app.exceptions import ScrapingError
 
-from app import schemas, utils
-import app.constants as constants
+from app import constants, schemas, utils
 from app.core.connections import get_http_client
+from app.exceptions import ScrapingError
 
 
 async def ranking_list() -> list[schemas.Ranking]:

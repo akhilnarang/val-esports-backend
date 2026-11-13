@@ -186,9 +186,7 @@ async def parse_event(event: Tag, client: Redis) -> schemas.Event:
     try:
         status = constants.EventStatus(raw_status)
     except ValueError:
-        logger.warning(
-            "Unknown VLR event status %r for event_id=%s; falling back to UNKNOWN", raw_status, event_id
-        )
+        logger.warning("Unknown VLR event status %r for event_id=%s; falling back to UNKNOWN", raw_status, event_id)
         status = constants.EventStatus.UNKNOWN
     prize = event.find("div", class_="mod-prize").get_text().strip().replace("\t", "").split("\n")[0]
     dates = event.find("div", class_="mod-dates").get_text().strip().replace("\t", "").split("\n")[0]
@@ -271,9 +269,7 @@ async def parse_events_data(id: str, cache_client: Redis | None = None) -> Parse
     # flat event-desc-item-value siblings became label/value pairs under
     # event-header-main-meta. Support both layouts (new first, old fallback).
     event["title"] = get_event_title(header)
-    subtitle_tag = header.find("h2", class_="event-header-main-desc") or header.find(
-        "h2", class_="event-desc-subtitle"
-    )
+    subtitle_tag = header.find("h2", class_="event-header-main-desc") or header.find("h2", class_="event-desc-subtitle")
     event["subtitle"] = clean_string(subtitle_tag.get_text()) if subtitle_tag else ""
 
     if meta := header.find("div", class_="event-header-main-meta"):

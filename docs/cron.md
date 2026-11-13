@@ -193,5 +193,6 @@ uv run fastapi dev
 To test jobs manually:
 ```python
 from app.cron.jobs import rankings_cron
+
 await rankings_cron({"redis": redis_client})
 ```
