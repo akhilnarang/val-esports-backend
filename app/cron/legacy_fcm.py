@@ -11,13 +11,43 @@ from zoneinfo import ZoneInfo
 
 from firebase_admin import messaging
 from sentry_sdk import capture_exception, get_current_scope
+from sqlalchemy import select
 
+from app import utils
 from app.constants import MatchStatus
+from app.core import connections
 from app.core.config import settings
+from app.db.models import RiotWebMatch
 from app.services import matches
 from app.services.fcm import get_app
 
 logger = logging.getLogger(__name__)
+
+
+async def _riot_ids(match_ids: list[str]) -> dict[str, tuple[str, str | None]]:
+    """Find the Riot series and tournament ids of VLR matches, which a favorite may be stored under.
+
+    :param match_ids: VLR match ids.
+    :return: VLR match id mapped to its Riot series id and tournament id; empty when the database
+        cannot be read, because the alert must still go out.
+    """
+    sessions = connections.subscription_sessions
+    if sessions is None:
+        return {}
+    try:
+        async with sessions() as session:
+            rows = await session.execute(
+                select(RiotWebMatch.vlr_match_id, RiotWebMatch.riot_id, RiotWebMatch.tournament_id).where(
+                    RiotWebMatch.vlr_match_id.in_(match_ids)
+                )
+            )
+            return {
+                vlr_id: (riot_id, tournament_id if utils.is_riot_tournament_id(tournament_id) else None)
+                for vlr_id, riot_id, tournament_id in rows
+            }
+    except Exception:
+        logger.warning("could not read the Riot ids of upcoming matches", exc_info=True)
+        return {}
 
 
 async def fcm_notification_cron(ctx: dict) -> None:
@@ -47,6 +77,8 @@ async def fcm_notification_cron(ctx: dict) -> None:
         return_exceptions=True,
     )
 
+    riot_ids = await _riot_ids([match.id for match in upcoming_matches])
+
     # Build notification messages, skipping any failed lookups
     messages = []
     for match, match_details in zip(upcoming_matches, all_match_details):
@@ -69,13 +101,24 @@ async def fcm_notification_cron(ctx: dict) -> None:
         if streams := match_details.videos.streams:
             payload |= {"stream_url": streams[0].url.unicode_string()}
 
-        messages.append(
+        riot_id, tournament_id = riot_ids.get(match.id, (None, None))
+        # A match or event the user favorited by its Riot id is subscribed under that id. The payload
+        # keeps the VLR id, which every released Android app can take. FCM allows five topics a condition.
+        usual = (
+            f"'event-{match_details.event.id}' in topics || 'match-{match.id}' in topics || "
+            f"'team-{team1_id}' in topics || 'team-{team2_id}' in topics"
+        )
+        conditions = [usual + (f" || 'match-{riot_id}' in topics" if riot_id else "")]
+        if tournament_id:
+            conditions.append(
+                f"'event-{tournament_id}' in topics && !('event-{match_details.event.id}' in topics || "
+                f"'match-{riot_id}' in topics || 'team-{team1_id}' in topics || 'team-{team2_id}' in topics)"
+            )
+        messages.extend(
             messaging.Message(
-                data=payload,
-                condition=f"'event-{match_details.event.id}' in topics || 'match-{match.id}' in topics || "
-                f"'team-{team1_id}' in topics || 'team-{team2_id}' in topics",
-                android=messaging.AndroidConfig(ttl=timedelta(minutes=30)),
-            ),
+                data=payload, condition=condition, android=messaging.AndroidConfig(ttl=timedelta(minutes=30))
+            )
+            for condition in conditions
         )
 
     # Don't bother sending if there's nothing to send

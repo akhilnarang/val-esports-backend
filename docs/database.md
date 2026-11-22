@@ -49,7 +49,7 @@ the video push falls back to when Redis is cold.
 | `players` | Last scraped VLR player page payload and the player's current team, refreshed by the favorite-players cron. |
 | `id_map` | Copy of the Redis team/event name→VLR ID hashes, loaded by `scripts/backfill_id_map.py` where the app runs. |
 | `events` | Events whose matches are in the ledger, with their circuit and when the circuit was last checked. |
-| `matches` | Completed series in the ranking ledger. Team IDs are NULL for TBD; `patch` is VLR's event patch; `source` records the provider. |
+| `matches` | The ranking ledger's series, VLR-sourced (`vlr_id` only), Riot-only (`riot_id` only) or merged (both); a check constraint requires one of them and each is unique. `id` is the primary key: the id of the provider the row was created from, its VLR id (1 to 10 digits) or its Riot series id (11 to 20 digits, so the two never collide); existing rows got `vlr_id = id` backfilled. It never changes, so a Riot-only row VLR later adopts keeps its Riot id as `id` and gains `vlr_id`. A Riot-only row is written by the schedule cron as soon as the match list shows the series, with its event (the VLR event of its tournament, else the Riot-created one) but no teams or score, which is what keeps the match under that id when VLR lists it later; the team rankings cron fills it once the series is settled, and only a row with a decisive score is rated. Team IDs are NULL for TBD; `patch` is VLR's event patch; `source` records the provider that created the row (`vlr`, `archive`, `riot_web`). |
 | `maps` | Played maps of a ledger match, oriented to the match's team order (`map_index` is the 0-based series position). |
 | `ranking_results` | One Elo-moving result per series or map, with both teams' ratings before it, team A's delta, and the winner. Unique per `(match_id, scope, map_index)`; a series row uses `map_index` `-1`. |
 | `team_elo` | Current series and map rating, win/loss counters, and first/last played dates per team, plus its primary region. Ratings never decay. |
@@ -69,10 +69,33 @@ linked series and is what maps a VLR event to Riot's `getStandings`; the details
 for the series it fetches, and leaves it NULL while it is unknown. Clear a wrong link by hand as
 shown in [cron.md](cron.md#job-schedule); the next run may link it again.
 
-The `riot_web_matches` table is created by the single revision `625f004fc4c9`, which also makes a
-`riot_matches` game exist before it is linked. The revision has never shipped, so it is edited in
-place rather than superseded; its downgrade refuses to run while an unlinked or partial
-`riot_matches` row exists (see [Riot game archive](#riot-game-archive-riot_matches)).
+The `riot_web_matches` table is created by the revision `625f004fc4c9`, which also makes a
+`riot_matches` game exist before it is linked; its downgrade refuses to run while an unlinked or
+partial `riot_matches` row exists (see [Riot game archive](#riot-game-archive-riot_matches)).
+That revision is left as it is. The revision `7d3a91c5e2b8` adds `matches.vlr_id` and
+`matches.riot_id`, backfills `vlr_id = id`, and widens `matches.id`, `maps.match_id` and
+`ranking_results.match_id`, `events.id` with `matches.event_id`, and `favorites.entity_id` from 10
+to 20 characters. Its downgrade refuses to run while a Riot-only or adopted match exists
+(`vlr_id IS NULL OR id <> vlr_id`) or a Riot-created event or a favorite under a Riot id does (`length(id) > 10`), because the
+old schema cannot hold their ids; delete those rows deliberately first.
+
+An `events` row whose id is longer than 10 digits is a Riot-created event: its id is the Riot
+tournament id (11 to 20 digits, which cannot collide with a VLR id of at most 10), it is named
+after Riot's league, and its circuit is `other` (a Game Changers series gets a row when it is listed, but never a result or a rating). It is
+written only together with its first Riot-only match's row, and keeps `circuit_checked_at` NULL so the
+daily tier-listing recheck never looks it up on VLR. When a VLR event is later linked to the same
+tournament, its matches move to that VLR event; the Riot-created row stays so its id keeps
+resolving, and nothing is rated twice. `riot_web_matches.vlr_event_id` stays VLR-only.
+
+`matches.riot_id` only mirrors `riot_web_matches.vlr_match_id`, which stays the source of truth
+for a link: the team rankings cron fills and repairs the mirror (see [cron.md](cron.md#job-schedule)).
+The tables keyed by a VLR page id (`match_insights`, `match_push_states`, `live_matches`,
+`live_activity_starts`, `riot_matches.vlr_match_id`, `riot_web_matches.vlr_match_id`) stay 10
+characters: a Riot-only match has no VLR page, so it never enters them, and the routes that reach
+them (`/matches/{id}/extra`, live activity) resolve any id to the VLR id first.
+The push tables keep the VLR id as their key also for a match clients know by its Riot id; that id is
+put in at send time. `favorites.entity_id` is 20 characters, because a match or event is kept under whichever id the client
+favorited it by, which can be Riot's; push routing and the favorites feed match a favorite against every id of the match.
 
 Bracket layouts are not stored: the bracket route fetches `getStandings` on demand and caches
 only a complete converted response in Redis for 60 seconds (see

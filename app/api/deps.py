@@ -10,7 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache import get_client
-from app.constants import ID_REGEX
+from app.constants import EVENT_REF_REGEX, ID_REGEX, MATCH_REF_REGEX
 from app.core import connections
 from app.core.config import settings
 from app.exceptions import ServiceUnavailableError, UnauthorizedError
@@ -85,8 +85,8 @@ def get_subscription_store(session: DatabaseSessionDep) -> SubscriptionStore:
     return SubscriptionStore(session)
 
 
-MatchId = Annotated[str, Path(pattern=r"^\d{1,10}$")]
-EventId = Annotated[str, Path(pattern=ID_REGEX)]
+MatchRef = Annotated[str, Path(pattern=MATCH_REF_REGEX)]
+EventId = Annotated[str, Path(pattern=EVENT_REF_REGEX)]  # a VLR event id or a Riot tournament id
 TeamId = Annotated[str, Path(pattern=ID_REGEX)]
 RedisDep = Annotated[Redis, Depends(get_redis_client)]
 SubscriptionStoreDep = Annotated[SubscriptionStore, Depends(get_subscription_store)]

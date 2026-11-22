@@ -2,12 +2,13 @@
 
 import logging
 import time
+from datetime import UTC, datetime
 
 from sentry_sdk import get_current_scope
 
 from app import schemas, utils
 from app.core import connections
-from app.services import matches, ranking_store, team_rankings
+from app.services import matches, ranking_store, riot_web_store, team_rankings
 from app.services.events import tier_event_circuits
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,29 @@ async def _recheck_other_events(sessions, now: int) -> bool:
             circuit = circuits.get(event.id, event.circuit)
             changed |= circuit != event.circuit
             await ranking_store.set_event_circuit(session, event.id, event.name, circuit, now)
+    return changed
+
+
+async def _ingest_riot_only(sessions) -> bool:
+    """Mirror Riot ids onto VLR rows, then add the settled series VLR never listed.
+
+    The mirroring transaction also moves a Riot-created event's matches to the VLR event its
+    tournament has since been linked to.
+
+    :param sessions: Session factory for the ranking database.
+    :return: True when any row was added, changed, or removed.
+    """
+    async with sessions.begin() as session:
+        changed = await ranking_store.attach_riot_ids(session)
+        changed |= await ranking_store.adopt_riot_events(session)
+    async with sessions() as session:
+        settled = await riot_web_store.settled_unlinked(session, datetime.now(UTC))
+    for series in settled:
+        try:
+            async with sessions.begin() as session:
+                changed |= await team_rankings.ingest_riot_series(session, series)
+        except Exception:
+            logger.warning("could not ingest Riot series %s; will retry", series.riot_id, exc_info=True)
     return changed
 
 
@@ -88,6 +112,10 @@ async def team_rankings_cron(ctx: dict) -> None:
                         changed |= await team_rankings.ingest_match(session, listed.id, details, circuit)
                 except Exception:
                     logger.warning("could not ingest match %s; will retry", listed.id, exc_info=True)
+    try:
+        changed |= await _ingest_riot_only(sessions)
+    except Exception:
+        logger.warning("could not ingest Riot-only series; will retry", exc_info=True)
     try:
         changed |= await _recheck_other_events(sessions, now)
     except Exception:

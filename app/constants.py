@@ -44,6 +44,16 @@ TBD = "tbd"
 NA = "n/a"  # VLR's navigation placeholder for a game that has no stats panel yet
 # Entity IDs as VLR names them: digits with no leading zero.
 ID_REGEX = r"^[1-9][0-9]{0,9}$"
+# The ``/matches/{id}`` path for VLR-only consumers: any 1-10 digits, as VLR's match pages accept.
+MATCH_ID_REGEX = r"^\d{1,10}$"
+# A Riot series or tournament id (18 digits live); a tournament id is also the id of a Riot-created
+# event. The 11-digit floor keeps it disjoint from ``ID_REGEX``.
+RIOT_ID_REGEX = r"^[1-9][0-9]{10,19}$"
+TOURNAMENT_ID_REGEX = RIOT_ID_REGEX
+# What the event routes and a favorited match or event accept: a VLR id, or a Riot tournament or series id.
+EVENT_REF_REGEX = r"^[1-9][0-9]{0,19}$"
+# What ``GET /matches/{id}`` accepts: a VLR id or a Riot series id (up to 20 digits).
+MATCH_REF_REGEX = r"^\d{1,20}$"
 TEST_MATCH_ID = "3141592653"
 TEST_TICK_KEY = "valesports:push:test_tick"
 # A tracked match whose page fails this many cron runs in a row is ended (e.g. VLR blocked our IP).
@@ -125,6 +135,14 @@ LIVE_STATUSES = frozenset({MatchStatus.LIVE.value, MatchStatus.ONGOING.value})
 FINAL_STATUSES = frozenset(
     {"final", MatchStatus.COMPLETED.value}
 )  # Detail pages say "final"; listings say "completed".
+
+
+class MatchSource(StrEnum):
+    """Where a ``matches`` row was first written from."""
+
+    VLR = "vlr"
+    ARCHIVE = "archive"
+    RIOT_WEB = "riot_web"
 
 
 class FavoriteType(StrEnum):
@@ -394,9 +412,16 @@ RIOT_WEB_LINK_WINDOW = timedelta(minutes=120)
 RIOT_WEB_LINK_FALLBACK_WINDOW = timedelta(minutes=360)  # only with exactly one candidate
 RIOT_WEB_DETAILS_BATCH = 30
 RIOT_WEB_DETAILS_REFRESH = timedelta(hours=1)  # completed matches gain VODs/locales for a while
+RIOT_WEB_LISTING_WINDOW = timedelta(days=3)  # how far either side of now an unlinked Riot series is listed
+# An unlinked series this close to starting gets its tournament id early, which listing it needs.
+RIOT_WEB_DETAILS_AHEAD = RIOT_WEB_LISTING_WINDOW
+RIOT_WEB_LEDGER_SETTLE = timedelta(hours=24)  # a series this old, still unlinked, is Riot-only
+RIOT_WEB_LIVE_MAX = timedelta(hours=6)  # longer than a Bo5 runs; an undecided series this old is not shown live
+RIOT_PLACEHOLDER_IMG = "https://www.vlr.gg/img/vlr/tmp/vlr.png"  # stands in for art Riot's schedule does not carry
 RIOT_WEB_DETAILS_SETTLE = timedelta(hours=48)  # after this a fetched match is never refetched
 RIOT_WEB_VODS_TIMEOUT = 1.0  # a match request waits at most this long for its stored VOD offsets
 RIOT_WEB_KEY_ALERTED_KEY = "valesports:riot_web:key_alerted"
+RIOT_WEB_STANDINGS_KEY = "valesports:riot_web:standings:{}"  # a Riot-created event page's name and dates
 RIOT_WEB_KEY_ALERT_INTERVAL = 3600
 # VOD ids go into playback URLs, so only these shapes are accepted.
 YOUTUBE_VOD_ID_REGEX = r"^[A-Za-z0-9_-]{11}$"

@@ -19,7 +19,7 @@ from pydantic import ValidationError
 from redis.asyncio import Redis
 from sqlalchemy.exc import SQLAlchemyError
 
-from app import cache
+from app import cache, utils
 from app.constants import (
     CACHE_TTL_RIOT_WEB_BRACKETS,
     RIOT_BRACKET_SECTION,
@@ -192,6 +192,7 @@ def sections_from(
     match_events: dict[str, str],
     tournament_events: set[str],
     vlr_teams: dict[str, str],
+    riot_created: bool = False,
 ) -> list[BracketSection]:
     """Convert the bracket sections owned by one event, preserving column, cell and match order.
 
@@ -209,6 +210,7 @@ def sections_from(
     :param match_events: Riot series id mapped to the VLR event its link names.
     :param tournament_events: VLR events every linked match in the tournament names.
     :param vlr_teams: Folded Riot name mapped to its VLR team id.
+    :param riot_created: Whether the request is for a Riot-created event, which is the whole tournament and so owns every section.
     :return: One section per Riot ``type: bracket`` section owned by the event, in Riot's order.
     """
     single_section = sum(
@@ -226,7 +228,7 @@ def sections_from(
                 for match in cell.matches
                 if match.id in match_events
             }
-            if not _owned(owners, tournament_events, event_id, single_section=single_section):
+            if not riot_created and not _owned(owners, tournament_events, event_id, single_section=single_section):
                 logger.info(
                     "withholding Riot bracket section %s for event %s: links name %s, tournament links name %s",
                     section.id,
@@ -282,7 +284,7 @@ async def _sections(event_id: str, redis: Redis | None) -> _Brackets:
     All mapped tournaments are fetched at once, so an event with several 5-second timeouts does
     not serialize them. Nothing is stored: the converted response is the only cache.
 
-    :param event_id: VLR event id.
+    :param event_id: VLR event id, or the Riot tournament id of a Riot-created event.
     :param redis: Request Redis client.
     :return: Converted sections with their fetch time, and whether any source was unanswered.
     """
@@ -290,9 +292,14 @@ async def _sections(event_id: str, redis: Redis | None) -> _Brackets:
     if sessions is None:
         return _Brackets([], None, True)
 
+    riot_created = not utils.is_vlr_event_id(event_id)
     try:
         async with sessions() as session:
-            tournament_ids = await riot_web_store.tournaments_for_event(session, event_id)
+            if riot_created:
+                # Only a tournament we store a series of: any other id would cost a Riot call per request.
+                tournament_ids = [event_id] if await riot_web_store.series_for_tournament(session, event_id) else []
+            else:
+                tournament_ids = await riot_web_store.tournaments_for_event(session, event_id)
     except SQLAlchemyError:
         logger.warning("could not read Riot tournaments for event %s", event_id, exc_info=True)
         return _Brackets([], None, True)
@@ -351,7 +358,9 @@ async def _sections(event_id: str, redis: Redis | None) -> _Brackets:
         async with sessions() as session:
             links = await riot_web_store.matches_by_riot_id(session, match_ids)
             match_events = await riot_web_store.events_by_riot_id(session, match_ids)
-            tournament_events = await riot_web_store.events_by_tournament(session, tournament_ids)
+            tournament_events = (
+                {} if riot_created else await riot_web_store.events_by_tournament(session, tournament_ids)
+            )
             vlr_teams = _vlr_team_ids(await riot_web_store.riot_team_fields(session))
     except SQLAlchemyError:
         logger.warning("could not read Riot series links for event %s", event_id, exc_info=True)
@@ -366,6 +375,7 @@ async def _sections(event_id: str, redis: Redis | None) -> _Brackets:
             match_events=match_events,
             tournament_events=tournament_events.get(tournament_id, set()),
             vlr_teams=vlr_teams,
+            riot_created=riot_created,
         )
         if converted:
             sections.extend(converted)
@@ -384,7 +394,7 @@ def _status(brackets: _Brackets) -> BracketStatus:
 
 
 async def event_brackets(event_id: str, client: Redis | None = None) -> EventBrackets:
-    """Return a VLR event's Riot brackets.
+    """Return an event's Riot brackets; a Riot-created event's id is its tournament id, which has no ownership to check.
 
     An event with no Riot tournament, an unset key, or an unreachable Riot answers with no
     sections rather than an error: a mapping gap is not a client error. ``status`` says whether
@@ -393,7 +403,7 @@ async def event_brackets(event_id: str, client: Redis | None = None) -> EventBra
     cached for Riot's 60-second CDN window, an incomplete one too, so a failing Riot is asked at
     most once a minute per event rather than on every request.
 
-    :param event_id: VLR event id.
+    :param event_id: VLR event id, or the Riot tournament id of a Riot-created event.
     :param client: Request Redis client.
     :return: The public bracket response.
     """

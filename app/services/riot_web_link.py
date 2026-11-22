@@ -215,3 +215,63 @@ def link(riot: Sequence[RiotCandidate], vlr: Sequence[schemas.Match], claimed: s
     if name_pairs >= 3 and not tier1_pairs:
         logger.error("Riot and VLR times disagree for every name match; check TIMEZONE against the host zone")
     return links
+
+
+def undecided_candidates(
+    teams: Sequence[str], league_name: str, start_time: datetime, vlr: Sequence[schemas.Match]
+) -> list[schemas.Match]:
+    """List the listed VLR matches with a team still undecided that may become this Riot series.
+
+    Riot can name both teams while VLR still shows TBD. Such an entry is not a fit yet, but it is the
+    same match once VLR fills in the names.
+
+    :param teams: The series' two Riot team names.
+    :param league_name: Its Riot league, which says whether it is a Game Changers competition.
+    :param start_time: Its start.
+    :param vlr: The VLR listing.
+    :return: The VLR matches within six hours whose decided team, if any, is one of the series'.
+    """
+    game_changers = is_game_changers(league_name)
+    ours = [team_keys(name, game_changers, riot=True) for name in teams]
+    found = []
+    for match in vlr:
+        sides = (match.team1.name, match.team2.name)
+        if not any(_is_tbd(name) for name in sides) or is_game_changers(match.event) != game_changers:
+            continue
+        if abs(match.time - start_time) > RIOT_WEB_LINK_FALLBACK_WINDOW:
+            continue
+        decided = [team_keys(name, game_changers, riot=False) for name in sides if not _is_tbd(name)]
+        if all(any(keys & mine for mine in ours) for keys in decided):
+            found.append(match)
+    return found
+
+
+def vlr_candidates(
+    teams: Sequence[str], league_name: str, start_time: datetime, vlr: Sequence[schemas.Match]
+) -> list[schemas.Match]:
+    """List the listed VLR matches that may be this Riot series: the same two teams within six hours.
+
+    Looser than :func:`link`, which needs one clear fit: any fit counts here, so a series VLR may
+    already be showing is not shown a second time or given an id of its own.
+
+    :param teams: The series' two Riot team names.
+    :param league_name: Its Riot league, which says whether it is a Game Changers competition.
+    :param start_time: Its start.
+    :param vlr: The VLR listing.
+    :return: The fitting VLR matches.
+    """
+    game_changers = is_game_changers(league_name)
+    ours = NamePair(
+        first=team_keys(teams[0], game_changers, riot=True), second=team_keys(teams[1], game_changers, riot=True)
+    )
+    found = []
+    for match in vlr:
+        if is_game_changers(match.event) != game_changers:
+            continue
+        theirs = NamePair(
+            first=team_keys(match.team1.name, game_changers, riot=False),
+            second=team_keys(match.team2.name, game_changers, riot=False),
+        )
+        if ours.matches(theirs) and abs(match.time - start_time) <= RIOT_WEB_LINK_FALLBACK_WINDOW:
+            found.append(match)
+    return found

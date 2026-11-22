@@ -81,7 +81,7 @@ async def head_to_head(
         MatchRecord.team_a_score != MatchRecord.team_b_score,
     ]
     if history.exclude_match_id is not None:
-        conditions.append(MatchRecord.id != history.exclude_match_id)
+        conditions.append(MatchRecord.vlr_id.is_distinct_from(history.exclude_match_id))
     rows = await session.execute(
         select(
             MatchRecord.played_on,

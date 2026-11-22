@@ -1,11 +1,13 @@
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from app.constants import EVENTS_URL
+from app.db.models import EventRecord, MatchRecord
 from app.exceptions import ScrapingError
 from app.services import events
 
@@ -163,14 +165,29 @@ async def test_event_brackets_follow_riot_layout(monkeypatch, make_database):
                 _riot_series(
                     "112019376623640336",
                     vlr_match_id="1233",
-                    event_id="2863",
+                    event_id=None,
                     tournament_id=BRACKETS_TOURNAMENT,
                     start_time=start,
                 ),
                 # The logo mirror matched these two Riot teams to VLR teams; Gen.G stays unmapped.
+                # This link names no event; the ledger row it adopted (its Riot id as id, with a VLR id) does.
+                EventRecord(id="2863", name="Masters Madrid", circuit="vct"),
                 _vlr_team("624", "Paper Rex", "PRX", riot_name="Paper Rex", riot_code="PRX"),
                 _vlr_team("2357", "Sentinels", "SEN", riot_name="Sentinels", riot_code="SEN"),
             ]
+        )
+
+        await session.flush()
+        session.add(
+            MatchRecord(
+                id="112019376623640336",
+                vlr_id="1233",
+                riot_id="112019376623640336",
+                event_id="2863",
+                played_on=start.date(),
+                source="riot_web",
+                ingested_at=0,
+            )
         )
 
     payload = json.loads((RIOT_FIXTURE_DIR / "bracket_mastersmadrid2024_standings.json").read_text())
@@ -701,3 +718,97 @@ async def test_event_brackets_skip_only_a_malformed_section(monkeypatch, make_da
     assert [section.name for section in result.sections] == ["Playoffs"]
     # The dropped section leaves the answer incomplete.
     assert result.status == BracketStatus.STALE
+
+
+@pytest.mark.asyncio
+async def test_riot_created_event_is_served_under_its_tournament_id(monkeypatch, make_database):
+    """A tournament no VLR event is known for gets an event page and brackets under its tournament id."""
+    import httpx2
+
+    from app.api.v1.endpoints.events import event_by_id
+    from app.constants import EventStatus, MatchStatus
+    from app.db.models import EventRecord, MatchRecord, RiotWebMatch
+    from app.services import brackets
+
+    sessions = await _bracket_sessions(monkeypatch, make_database)
+    _enable_brackets(monkeypatch)
+    now = datetime.now(UTC)
+    settled = {"tournament_id": BRACKETS_TOURNAMENT, "game_wins": {"Paper Rex": 2, "Gen.G": 0}, "games": []}
+    async with sessions.begin() as session:
+        # The schedule cron gave the series its row, with the Riot-created event, when the list first showed it.
+        session.add(EventRecord(id=BRACKETS_TOURNAMENT, name="Test League", circuit="other"))
+        await session.flush()
+        session.add(
+            MatchRecord(
+                id="112019385324229017",
+                riot_id="112019385324229017",
+                event_id=BRACKETS_TOURNAMENT,
+                played_on=now.date(),
+                source="riot_web",
+                ingested_at=0,
+            )
+        )
+        session.add_all(
+            [
+                _vlr_team("624", "Paper Rex", "PRX", riot_name="Paper Rex", riot_code="PRX"),
+                RiotWebMatch(
+                    riot_id="112019385324229017",
+                    start_time=now - timedelta(hours=30),
+                    league_name="Test League",
+                    teams=[{"name": "Paper Rex"}, {"name": "Gen.G"}],
+                    best_of=3,
+                    tournament_id=BRACKETS_TOURNAMENT,
+                    details=settled,
+                ),
+                RiotWebMatch(
+                    riot_id="112019385324229099",
+                    start_time=now - timedelta(hours=29),
+                    league_name="Test League",
+                    teams=[{"name": "TBD"}, {"name": "Gen.G"}],
+                    best_of=3,
+                    tournament_id=BRACKETS_TOURNAMENT,
+                ),
+                # A tournament that a VLR event has since claimed is served from VLR.
+                _riot_series(
+                    "112019385324229018",
+                    vlr_match_id="1234",
+                    event_id="2863",
+                    tournament_id="112019354266558217",
+                    start_time=now,
+                ),
+            ]
+        )
+    payload = json.loads((RIOT_FIXTURE_DIR / "bracket_mastersmadrid2024_standings.json").read_text())
+
+    async def answer(client, url, *, params=None, **_kwargs):
+        return httpx2.Response(200, json=payload, request=client.build_request("GET", url, params=params))
+
+    redis = AsyncMock()
+    redis.get.return_value = None
+    with patch("httpx2.AsyncClient.get", autospec=True, side_effect=answer):
+        event = await event_by_id(BRACKETS_TOURNAMENT, redis)
+        shown = await brackets.event_brackets(BRACKETS_TOURNAMENT, redis)
+
+    assert (event.id, event.title, event.dates, event.status) == (
+        BRACKETS_TOURNAMENT,
+        "Test League: Masters Madrid",
+        "Mar 14 – 24, 2024",
+        EventStatus.COMPLETED,
+    )
+    assert (event.prize, event.location, event.standings, [team.id for team in event.teams]) == ("", "", [], ["624"])
+    # The TBD fixture is left out; the other is shown under its Riot id, as the match list shows it.
+    assert [(match.id, match.status, [team.score for team in match.teams]) for match in event.matches] == [
+        ("112019385324229017", MatchStatus.COMPLETED, [2, 0])
+    ]
+    assert shown.event_id == BRACKETS_TOURNAMENT and shown.sections
+
+    # Without Riot's end time a running tournament whose stored series are all settled is not "completed".
+    with patch("httpx2.AsyncClient.get", side_effect=httpx2.ConnectError("down")):
+        assert (await event_by_id(BRACKETS_TOURNAMENT, redis)).status == EventStatus.UNKNOWN
+
+    from_vlr = SimpleNamespace(matches=[])
+    with patch("app.services.events.get_event_by_id", AsyncMock(return_value=from_vlr)) as vlr:
+        assert await event_by_id("112019354266558217", redis) is from_vlr
+    # The app files the answer under the id it asked for, so that id comes back, not VLR's.
+    assert from_vlr.id == "112019354266558217"
+    vlr.assert_awaited_once_with("2863", redis)

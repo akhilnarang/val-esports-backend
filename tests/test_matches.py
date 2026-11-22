@@ -3,13 +3,13 @@ import json
 import math
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from bs4 import BeautifulSoup
 
 from app import constants
-from app.constants import MatchStatus
+from app.constants import RIOT_PLACEHOLDER_IMG, MatchStatus
 from app.exceptions import ScrapingError
 from app.services import matches
 
@@ -411,7 +411,7 @@ def test_live_update_api_stores_token_and_favorites(monkeypatch, make_database):
             client.put(
                 f"{base}/favorites",
                 headers=headers,
-                json={"teams": ["1"], "matches": ["2"], "players": ["3"], "events": ["4"]},
+                json={"teams": ["1"], "matches": ["2"], "players": ["3"], "events": ["4", "112053399716844250"]},
             ).status_code
             == 204
         )
@@ -421,7 +421,7 @@ def test_live_update_api_stores_token_and_favorites(monkeypatch, make_database):
             "teams": ["1"],
             "matches": ["2"],
             "players": ["3"],
-            "events": ["4"],
+            "events": ["4", "112053399716844250"],
         }
         assert client.put(f"{base}/favorites", headers=headers, json={"teams": ["5", "1"]}).status_code == 204
         # A zero-padded ID would overflow VARCHAR(10) in PostgreSQL and 500 instead of 422.
@@ -433,7 +433,7 @@ def test_live_update_api_stores_token_and_favorites(monkeypatch, make_database):
             "teams": ["5"],
             "matches": [],
             "players": ["3"],
-            "events": ["4"],
+            "events": ["4", "112053399716844250"],
         }
         unknown = "/api/v1/live-updates/clients/33333333-3333-4333-8333-333333333333/favorites"
         assert client.request("DELETE", unknown, headers=headers, json=removal).status_code == 404
@@ -584,9 +584,25 @@ def test_live_update_api_stores_token_and_favorites(monkeypatch, make_database):
             assert [(team["id"], team["score"]) for team in state_data["teams"]] == [("1", 1), ("2", 1)]
             assert state_data["stage"] == "Playoffs: Grand Final"
 
-            assert (
-                client.put(f"{android_client}/favorites", headers=headers, json={"matches": ["123"]}).status_code == 204
-            )
+            # A match favorited under its Riot id, before VLR listed it, is routed by its VLR id.
+            async def link_series():
+                from app.db.models import RiotWebMatch
+
+                async with sessions.begin() as session:
+                    session.add(
+                        RiotWebMatch(
+                            riot_id="115576361461208999",
+                            start_time=datetime.now(UTC),
+                            league_name="Champions",
+                            teams=[{"name": "Alpha"}, {"name": "Beta"}],
+                            vlr_match_id="123",
+                        )
+                    )
+
+            asyncio.run(link_series())
+            favorites = {"matches": ["115576361461208999"]}
+            assert client.put(f"{android_client}/favorites", headers=headers, json=favorites).status_code == 204
+            assert client.get(f"{android_client}/favorites", headers=headers).json()["matches"] == favorites["matches"]
             assert client.put(f"{android_client}/token", headers=headers, json={"token": "CCDD"}).status_code == 204
 
             async def pending_ios_starts():
@@ -594,6 +610,7 @@ def test_live_update_api_stores_token_and_favorites(monkeypatch, make_database):
                     return await SubscriptionStore(session).pending_starts(Routing("123", None, [], []))
 
             assert asyncio.run(pending_ios_starts()) == [("22222222-2222-4222-8222-222222222222", "ccdd")]
+
             assert (
                 client.put(
                     f"{android_client}/token", headers=headers, json={"token": "tok:123", "platform": "android"}
@@ -607,6 +624,38 @@ def test_live_update_api_stores_token_and_favorites(monkeypatch, make_database):
             failed = client.post(f"{android_client}/matches/123/live-activity", headers=headers)
             assert (failed.status_code, failed.json()) == (503, {"detail": "FCM start failed"})
             assert client.post(f"{android_client}/matches/123/live-activity", headers=headers).status_code == 404
+
+            # Once the match has the row that makes its Riot id the one clients know, iOS is sent that
+            # id. Android is still sent the VLR id, the only one released Android apps accept.
+            async def keep_riot_id():
+                from app.db.models import EventRecord, MatchRecord
+
+                async with sessions.begin() as session:
+                    session.add(EventRecord(id="77", name="Event", circuit="other"))
+                    await session.flush()
+                    session.add(
+                        MatchRecord(
+                            id="115576361461208999",
+                            riot_id="115576361461208999",
+                            event_id="77",
+                            played_on=datetime.now(UTC).date(),
+                            source="riot_web",
+                            ingested_at=0,
+                        )
+                    )
+
+            asyncio.run(keep_riot_id())
+            android_token = {"token": "tok:123", "platform": "android"}
+            assert client.put(f"{android_client}/token", headers=headers, json=android_token).status_code == 204
+            send_fcm.reset_mock()
+            send_fcm.return_value = messaging.BatchResponse([messaging.SendResponse({"name": "sent"}, None)])
+            riot_start = f"{android_client}/matches/115576361461208999/live-activity"
+            assert client.post(riot_start, headers=headers).status_code == 204
+            assert '"match_id":"123"' in send_fcm.call_args.kwargs["messages"][0].data["state"]
+            assert client.put(f"{android_client}/token", headers=headers, json={"token": "CCDD"}).status_code == 204
+            mock_apns.send_start.side_effect = None
+            assert client.post(riot_start, headers=headers).status_code == 204
+            assert mock_apns.send_start.call_args.args[2].match_id == "115576361461208999"
 
         assert client.delete(f"{base}/token", headers=headers).status_code == 204
     finally:
@@ -816,6 +865,96 @@ async def test_match_vods_start_each_vlr_map_at_its_riot_offset(monkeypatch, mak
     # A reversed series score is a different result even though the multiset of wins matches.
     assert await match_vods.map_vods("12345", _vlr_details([1, 2, 3, 4], [3, 1])) == []
 
+    # The route takes any of a match's ids. A linked Riot series id serves the same VLR body.
+    with patch("app.services.matches.cached_match_by_id", AsyncMock(return_value=details)) as cached:
+        by_riot_id = await get_match_by_id("115576361461208325", AsyncMock())
+    assert by_riot_id.model_dump(mode="json") == preserved.model_dump(mode="json")
+    cached.assert_awaited_once_with("12345", ANY)
+
+    from fastapi import HTTPException
+
+    from app.db.models import EventRecord, MatchRecord, Team
+
+    riot_only = "115576361461208400"
+    async with sessions.begin() as session:
+        session.add(EventRecord(id="2283", name="Champions 2026", circuit="vct"))
+        session.add(
+            Team(id="7", source="vlr", riot_name="Alpha", logo="", riot_logo=None, first_seen_at=0, last_fetched_at=0)
+        )
+        session.add(
+            RiotWebMatch(
+                riot_id=riot_only,
+                start_time=now - timedelta(hours=2),
+                league_name="Champions",
+                best_of=3,
+                teams=[{"name": "Alpha"}, {"name": "Beta"}],
+                details=StoredDetails(
+                    tournament_id="1",
+                    game_wins={"Alpha": 2, "Beta": 0},
+                    games=[
+                        {
+                            "number": 1,
+                            "state": "completed",
+                            "vods": [
+                                {"provider": "youtube", "locale": "en-US", "parameter": "MZjaOtjtRlU", "start_ms": 5000}
+                            ],
+                        },
+                        {"number": 2, "state": "completed"},
+                        {"number": 3, "state": "unneeded"},
+                    ],
+                ).model_dump(mode="json"),
+            )
+        )
+        await session.flush()
+        for match_id, vlr_id, riot_id in (
+            (riot_only, None, riot_only),
+            ("12345", "12345", None),
+        ):
+            session.add(
+                MatchRecord(
+                    id=match_id,
+                    vlr_id=vlr_id,
+                    riot_id=riot_id,
+                    event_id="2283",
+                    stage="Grand Final",
+                    played_on=now.date(),
+                    source="riot_web",
+                    ingested_at=0,
+                )
+            )
+    with patch("app.services.matches.cached_match_by_id", AsyncMock()) as cached:
+        body = await get_match_by_id(riot_only, AsyncMock())
+        with pytest.raises(HTTPException) as unknown:
+            await get_match_by_id("115576361461208499", AsyncMock())
+    cached.assert_not_awaited()
+    assert unknown.value.status_code == 404
+    assert [(team.name, team.score, team.id) for team in body.teams] == [("Alpha", 2, "7"), ("Beta", 0, None)]
+    # A mirrored team whose own logo columns are unusable, and an unmirrored one, show the placeholder.
+    assert {str(team.img) for team in body.teams} == {RIOT_PLACEHOLDER_IMG}
+    assert (body.event.id, body.event.series, body.event.stage, body.event.status) == (
+        "2283",
+        "Champions",
+        "Grand Final",
+        "completed",
+    )
+    assert (body.total_maps, body.map_count, body.data, body.insights) == (3, 2, [], None)
+    assert [(item.map_number, len(item.links)) for item in body.map_vods] == [(1, 1)]
+
+    # An unledgered series names the Riot-created event of its tournament.
+    async with sessions.begin() as session:
+        session.add(
+            RiotWebMatch(
+                riot_id="115576361461208500",
+                start_time=now + timedelta(hours=2),
+                league_name="Champions",
+                teams=[{"name": "Alpha"}, {"name": "Beta"}],
+                tournament_id="115576361459045501",
+            )
+        )
+    with patch("app.services.matches.cached_match_by_id", AsyncMock()):
+        by_riot_id = await get_match_by_id("115576361461208500", AsyncMock())
+    assert by_riot_id.event.id == "115576361459045501"
+
 
 @pytest.mark.asyncio
 async def test_map_vods_are_absent_without_stored_riot_data(monkeypatch, make_database):
@@ -861,18 +1000,20 @@ async def test_map_vods_are_absent_without_stored_riot_data(monkeypatch, make_da
 
 
 @pytest.mark.asyncio
-async def test_match_extra_serves_linked_riot_games_by_vlr_team(make_database):
+async def test_match_extra_serves_linked_riot_games_by_vlr_team(monkeypatch, make_database):
     """Riot's stored game for a VLR map comes back with VLR's team slots, player names and radar locations."""
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     from app.api.v1.endpoints.matches import get_match_extra
+    from app.core import connections
     from app.db.migrations import upgrade_to_head
-    from app.db.models import RiotMatch
+    from app.db.models import EventRecord, MatchRecord, RiotMatch
     from app.schemas.riot import MatchExtra
 
     database_url = make_database()
     await upgrade_to_head(database_url)
     sessions = async_sessionmaker(create_async_engine(database_url), expire_on_commit=False)
+    monkeypatch.setattr(connections, "subscription_sessions", sessions)
     # A real Riot payload, trimmed to two rounds; Riot's Red side is VLR's team2 on this map.
     data = json.loads((FIXTURE_DIR / "riot" / "game_754737_map3.json").read_text())
     link = {"red_team": "team2", "blue_team": "team1", "same_game": True, "confidence": 0.99, "reason": "rosters"}
@@ -882,10 +1023,25 @@ async def test_match_extra_serves_linked_riot_games_by_vlr_team(make_database):
             RiotMatch(riot_id="linked", vlr_match_id="754737", map_number=3, started_at=started, data=data, link=link)
         )
         session.add(RiotMatch(riot_id="unlinked", started_at=started, data=data))
+        session.add(EventRecord(id="1", name="E", circuit="vct"))
+        await session.flush()
+        session.add(
+            MatchRecord(
+                id="115576361461208777",
+                vlr_id="754737",
+                event_id="1",
+                played_on=started.date(),
+                source="vlr",
+                ingested_at=0,
+            )
+        )
 
     async with sessions() as session:
         extra = (await get_match_extra("754737", session)).model_dump(mode="json")
         assert await get_match_extra("1", session) == MatchExtra(maps=[])
+        # A row Riot created and VLR adopted keeps its Riot id, which opens the same games.
+        by_own_id = (await get_match_extra("115576361461208777", session)).model_dump(mode="json")
+        assert by_own_id == extra
     [game] = extra["maps"]
     assert {key: game[key] for key in ("map_number", "map", "duration_millis")} == {
         "map_number": 3,
@@ -925,3 +1081,134 @@ async def test_match_extra_serves_linked_riot_games_by_vlr_team(make_database):
     planter = next(p for p in first["plant"]["player_locations"] if p["name"] == first["planter"])
     assert planter["location"] == first["plant"]["location"]
     assert first["defuse"] is None
+
+
+@pytest.mark.asyncio
+async def test_match_list_adds_unlisted_riot_series_in_order_without_duplicating_vlr(monkeypatch, make_database):
+    """A Riot series VLR does not list appears in its place; one VLR lists, or that is far off, does not."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app import schemas
+    from app.core import connections
+    from app.core.config import settings
+    from app.db.migrations import upgrade_to_head
+    from app.db.models import RiotWebMatch, Team
+    from app.services import ranking_store, riot_listing
+
+    database_url = make_database()
+    await upgrade_to_head(database_url)
+    engine = create_async_engine(database_url)
+    sessions = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(connections, "subscription_sessions", sessions)
+    monkeypatch.setattr(settings, "RIOT_WEB_API_KEY", "test-key")
+    now = datetime.now(UTC)
+
+    def vlr(match_id, hours, status, team1, team2):
+        return schemas.ListedMatch(
+            id=match_id,
+            team1=schemas.MatchTeam(name=team1),
+            team2=schemas.MatchTeam(name=team2),
+            status=status,
+            time=now + timedelta(hours=hours),
+            event="Champions",
+            series="Final",
+        )
+
+    def riot(riot_id, hours, teams, **fields):
+        return RiotWebMatch(
+            riot_id=riot_id,
+            start_time=now + timedelta(hours=hours),
+            league_name="Challengers BR",
+            teams=[{"name": name} for name in teams],
+            tournament_id="112053399716844250",
+            **fields,
+        )
+
+    async with sessions.begin() as session:
+        session.add(Team(id="7", source="vlr", name="Alpha", riot_name="Alpha", first_seen_at=0, last_fetched_at=0))
+        session.add_all(
+            [
+                # Nobody lists it. Riot's early details answer 0 wins each, which is not a score yet.
+                riot(
+                    "115576361461208401",
+                    5,
+                    ["Alpha", "Beta"],
+                    details={"tournament_id": "1", "game_wins": {"Alpha": 0, "Beta": 0}, "games": []},
+                ),
+                riot("115576361461208407", 3, ["Lambda", "Mu"], vlr_match_id="903"),  # linked: VLR's own entry
+                # VLR lists it before the link is stored: VLR's entry is the match.
+                riot("115576361461208402", 7, ["Gamma", "Delta"]),
+                riot(
+                    "115576361461208403",
+                    -30,
+                    ["Eps", "Zeta"],
+                    details={"tournament_id": "1", "game_wins": {"Eps": 2, "Zeta": 0}, "games": []},
+                ),
+                riot("115576361461208404", 6, ["TBD", "Beta"]),
+                riot("115576361461208405", 24 * 5, ["Eta", "Theta"]),  # too far
+                riot("115576361461208406", 8, ["Iota", "Kappa"], vlr_match_id="999"),
+                # A rematch of a match VLR lists and has linked: it is listed itself, not taken for VLR's entry.
+                riot("115576361461208408", 2, ["One", "Two"], vlr_match_id="900"),
+                riot("115576361461208409", 4, ["One", "Two"]),
+                # VLR lists it with a team still undecided: VLR's entry and id come first.
+                riot("115576361461208411", 6, ["Nu", "Xi"]),
+            ]
+        )
+    listed = [
+        vlr("900", 2, MatchStatus.UPCOMING, "One", "Two"),
+        vlr("903", 3, MatchStatus.UPCOMING, "Lambda", "Mu"),
+        vlr("905", 6, MatchStatus.UPCOMING, "TBD", "Xi"),
+        vlr("901", 7, MatchStatus.UPCOMING, "Gamma", "Delta"),
+        vlr("902", 9, MatchStatus.UPCOMING, "Three", "Four"),
+        vlr("999", -40, MatchStatus.COMPLETED, "Iota", "Kappa"),
+    ]
+
+    # The schedule cron gives each series VLR does not list its row, which is what lists it.
+    async with sessions.begin() as session:
+        await ranking_store.keep_listed(session, listed, now)
+    result = await riot_listing.with_riot_only(listed)
+
+    assert [(item.id, item.status) for item in result] == [
+        ("900", MatchStatus.UPCOMING),
+        ("903", MatchStatus.UPCOMING),
+        ("115576361461208409", MatchStatus.UPCOMING),
+        ("115576361461208401", MatchStatus.UPCOMING),
+        ("905", MatchStatus.UPCOMING),
+        ("901", MatchStatus.UPCOMING),
+        ("902", MatchStatus.UPCOMING),
+        ("115576361461208403", MatchStatus.COMPLETED),
+        ("999", MatchStatus.COMPLETED),
+    ]
+    upcoming, completed = result[3], result[7]
+    assert (upcoming.team1.id, upcoming.team2.id, upcoming.event, upcoming.event_id) == (
+        "7",
+        None,
+        "Challengers BR",
+        "112053399716844250",  # the Riot-created event of its tournament: always an event that opens
+    )
+    assert (upcoming.team1.score, upcoming.team2.score) == (None, None)
+    assert [(team.name, team.score) for team in (completed.team1, completed.team2)] == [("Eps", 2), ("Zeta", 0)]
+
+    # VLR then lists the match: its entry keeps the Riot id, before the link is stored and after.
+    # A later series of the same teams does not take the entry from the one at the same time.
+    listed.insert(2, vlr("904", 5, MatchStatus.UPCOMING, "Alpha", "Beta"))
+    async with sessions.begin() as session:
+        session.add(riot("115576361461208410", 8, ["Alpha", "Beta"]))
+        await session.flush()
+        await ranking_store.keep_listed(session, [], now)
+    for link in (None, "904"):
+        if link:
+            async with sessions.begin() as session:
+                (await session.get(RiotWebMatch, "115576361461208401")).vlr_match_id = link
+        relisted = await riot_listing.with_riot_only(listed)
+        shown = [(item.id, item.team1.name) for item in relisted]
+        assert shown[3] == ("115576361461208401", "Alpha") and "115576361461208410" in dict(shown)
+        assert relisted[3].event_id == "112053399716844250"  # its event keeps the tournament id too
+
+    # With the Riot key unset, and when the database cannot be read, the list is VLR's alone.
+    monkeypatch.setattr(settings, "RIOT_WEB_API_KEY", None)
+    assert await riot_listing.with_riot_only(listed) == listed
+    monkeypatch.setattr(settings, "RIOT_WEB_API_KEY", "test-key")
+    monkeypatch.setattr(connections, "subscription_sessions", None)
+    assert await riot_listing.with_riot_only(listed) == listed
+    await engine.dispose()

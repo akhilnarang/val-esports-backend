@@ -3,15 +3,19 @@
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import cast
 
-from sqlalchemy import and_, case, delete, func, or_, select
+from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
-from app.constants import Circuit, RankingScope
-from app.db.models import EventRecord, MapRecord, MatchRecord, RankingResult, Team, TeamCircuit, TeamElo
+from app import schemas, utils
+from app.constants import RIOT_WEB_LISTING_WINDOW, TBD, Circuit, MatchSource, RankingScope
+from app.db.models import EventRecord, MapRecord, MatchRecord, RankingResult, RiotWebMatch, Team, TeamCircuit, TeamElo
+from app.services import riot_web_store
+from app.services.riot_web_link import undecided_candidates, vlr_candidates
 
 
 @dataclass(slots=True, frozen=True)
@@ -88,7 +92,7 @@ class StoredListing:
 
 
 async def stored_listings(session: AsyncSession) -> dict[str, StoredListing]:
-    """Read what the ledger holds for each match, keyed by match ID.
+    """Read what the ledger holds for each VLR match, keyed by VLR match ID; Riot-only rows are left out.
 
     :param session: Caller-owned database session.
     :return: Stored summaries the cron compares with the VLR listing.
@@ -100,7 +104,7 @@ async def stored_listings(session: AsyncSession) -> dict[str, StoredListing]:
         )
     )
     return {
-        match.id: StoredListing(
+        match.vlr_id: StoredListing(
             played_on=match.played_on,
             ingested_at=match.ingested_at,
             team_a_id=match.team_a_id,
@@ -110,6 +114,7 @@ async def stored_listings(session: AsyncSession) -> dict[str, StoredListing]:
             maps=maps,
         )
         for match, maps in rows
+        if match.vlr_id is not None
     }
 
 
@@ -336,6 +341,117 @@ async def set_event_circuit(session: AsyncSession, event_id: str, name: str, cir
     )
 
 
+async def ensure_riot_event(session: AsyncSession, tournament_id: str, name: str, circuit: Circuit) -> None:
+    """Create the Riot-created event whose id is a Riot tournament id, leaving an existing one alone.
+
+    ``circuit_checked_at`` stays NULL, which keeps :func:`stale_other_events` from crawling VLR's tier
+    listings for an id VLR does not know.
+
+    :param session: Caller-owned database session.
+    :param tournament_id: Riot tournament id, which becomes the event id.
+    :param name: Riot's league name.
+    :param circuit: Circuit the event's matches count towards.
+    :return: None.
+    """
+    await session.execute(
+        insert(EventRecord)
+        .values(id=tournament_id, name=name, circuit=circuit)
+        .on_conflict_do_nothing(index_elements=[EventRecord.id])
+    )
+
+
+async def keep_listed(session: AsyncSession, listing: Sequence[schemas.Match], now: datetime) -> None:
+    """Give each Riot series VLR does not list its ``matches`` row, which is what puts it in the match list.
+
+    The row's id is the series id and it is written once, so the match keeps that id when VLR lists
+    it later. Its event is the one VLR event of its tournament, else the Riot-created event whose id
+    is the tournament id, so a series whose tournament is not known yet waits. A series is also left
+    out while a team is undecided, or while a listed VLR match no other series is linked to may be
+    the same one, including one VLR still shows with an undecided team. The row has no teams or score until the series' result is stored.
+
+    :param session: Caller-owned database session.
+    :param listing: The VLR match list.
+    :param now: When the run started.
+    """
+    series = (
+        await session.execute(
+            select(
+                RiotWebMatch.riot_id,
+                RiotWebMatch.start_time,
+                RiotWebMatch.teams,
+                RiotWebMatch.league_name,
+                RiotWebMatch.tournament_id,
+            ).where(
+                RiotWebMatch.vlr_match_id.is_(None),
+                RiotWebMatch.start_time.between(now - RIOT_WEB_LISTING_WINDOW, now + RIOT_WEB_LISTING_WINDOW),
+                RiotWebMatch.riot_id.not_in(select(MatchRecord.id)),
+            )
+        )
+    ).all()
+    if not series:
+        return
+    claimed = await riot_web_store.linked_vlr_ids(session)
+    vlr_events = await riot_web_store.events_by_tournament(
+        session, [row.tournament_id for row in series if row.tournament_id]
+    )
+    rows = []
+    for riot_id, start_time, teams, league_name, tournament_id in series:
+        names = [team["name"].strip() for team in teams]
+        if len(names) != 2 or any(name.casefold() == TBD for name in names):
+            continue
+        if not utils.is_riot_tournament_id(tournament_id):
+            continue
+        if any(match.id not in claimed for match in vlr_candidates(names, league_name, start_time, listing)):
+            continue
+        event_ids = vlr_events.get(tournament_id, set())
+        # VLR may list the match with a team still undecided; its entry and its id come first.
+        if any(
+            not event_ids or match.event_id in event_ids
+            for match in undecided_candidates(names, league_name, start_time, listing)
+        ):
+            continue
+        event_id = next(iter(event_ids)) if len(event_ids) == 1 else None
+        if event_id is None or await session.get(EventRecord, event_id) is None:
+            event_id = tournament_id
+            await ensure_riot_event(session, tournament_id, league_name, Circuit.OTHER)
+        rows.append(
+            {
+                "id": riot_id,
+                "riot_id": riot_id,
+                "event_id": event_id,
+                "played_on": start_time.date(),
+                "source": MatchSource.RIOT_WEB,
+                "ingested_at": int(now.timestamp()),
+            }
+        )
+    if rows:
+        await session.execute(insert(MatchRecord).values(rows).on_conflict_do_nothing())
+
+
+async def adopt_riot_events(session: AsyncSession) -> bool:
+    """Move the ledger rows of a Riot-created event to the VLR event its tournament has since been linked to.
+
+    Only a tournament that names exactly one stored VLR event is adopted. The Riot-created event row
+    stays, so its id keeps resolving; its matches move rather than copy, so nothing is rated twice.
+
+    :param session: Caller-owned database session.
+    :return: True when any match moved.
+    """
+    created = list(await session.scalars(select(EventRecord.id).where(func.length(EventRecord.id) > 10)))
+    changed = False
+    for tournament_id, vlr_ids in (await riot_web_store.events_by_tournament(session, created)).items():
+        if len(vlr_ids) != 1 or await session.get(EventRecord, vlr_id := next(iter(vlr_ids))) is None:
+            continue
+        moved = await session.execute(
+            update(MatchRecord)
+            .where(MatchRecord.event_id == tournament_id)
+            .values(event_id=vlr_id)
+            .returning(MatchRecord.id)
+        )
+        changed |= moved.first() is not None
+    return changed
+
+
 async def stale_other_events(session: AsyncSession, checked_before: int) -> list[EventRecord]:
     """Read events still assigned no circuit whose tier listing check has gone stale.
 
@@ -459,3 +575,75 @@ async def head_to_head_results(
         ).scalars()
     )
     return match_rows, map_rows
+
+
+# What a Riot-only row takes over from the VLR row of the same match.
+_FOLDED = (
+    "vlr_id",
+    "event_id",
+    "stage",
+    "played_on",
+    "team_a_id",
+    "team_b_id",
+    "team_a_score",
+    "team_b_score",
+    "patch",
+    "ingested_at",
+)
+
+
+async def attach_riot_ids(session: AsyncSession) -> bool:
+    """Mirror each Riot series link onto the ledger and fold a duplicated series into its VLR row.
+
+    ``riot_web_matches.vlr_match_id`` is the source of truth; ``matches.riot_id`` only mirrors it.
+    A mirror the link no longer backs is cleared first. A Riot-only row whose series has since been
+    linked to a VLR match that has its own row is the same match stored twice. Clients know it by the
+    Riot row's id, so that row takes over the VLR row's values and maps and the VLR row is deleted;
+    the results of both go, for the rebuild to write once. Then every linked VLR row gets its mirror.
+
+    :param session: Caller-owned database session.
+    :return: True when any row changed.
+    """
+    linked_vlr = select(RiotWebMatch.vlr_match_id).where(RiotWebMatch.riot_id == MatchRecord.riot_id)
+    changed = bool(
+        (
+            await session.execute(
+                update(MatchRecord)
+                .where(
+                    MatchRecord.vlr_id.is_not(None),
+                    MatchRecord.riot_id.is_not(None),
+                    MatchRecord.vlr_id.is_distinct_from(linked_vlr.scalar_subquery()),
+                )
+                .values(riot_id=None)
+                .returning(MatchRecord.id)
+            )
+        ).first()
+    )
+    vlr_row = aliased(MatchRecord)
+    duplicates = (
+        await session.execute(
+            select(MatchRecord.id, vlr_row)
+            .join(RiotWebMatch, RiotWebMatch.riot_id == MatchRecord.riot_id)
+            .join(vlr_row, vlr_row.vlr_id == RiotWebMatch.vlr_match_id)
+            .where(MatchRecord.vlr_id.is_(None))
+        )
+    ).all()
+    for riot_row_id, vlr in duplicates:
+        values = {name: getattr(vlr, name) for name in _FOLDED}
+        await session.execute(delete(RankingResult).where(RankingResult.match_id.in_([riot_row_id, vlr.id])))
+        await session.execute(delete(MapRecord).where(MapRecord.match_id == riot_row_id))
+        await session.execute(update(MapRecord).where(MapRecord.match_id == vlr.id).values(match_id=riot_row_id))
+        await session.delete(vlr)
+        await session.flush()
+        await session.execute(update(MatchRecord).where(MatchRecord.id == riot_row_id).values(**values))
+        changed = True
+    mirrored = await session.execute(
+        update(MatchRecord)
+        .where(
+            MatchRecord.riot_id.is_(None),
+            MatchRecord.vlr_id == RiotWebMatch.vlr_match_id,
+        )
+        .values(riot_id=RiotWebMatch.riot_id)
+        .returning(MatchRecord.id)
+    )
+    return bool(mirrored.first()) or changed

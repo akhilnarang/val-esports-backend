@@ -1,8 +1,11 @@
+import contextlib
+
 from fastapi import APIRouter
 
-from app import cache, schemas
+from app import cache, schemas, utils
 from app.api import deps
-from app.services import brackets, events
+from app.exceptions import ServiceUnavailableError
+from app.services import brackets, events, match_refs, riot_events
 
 router = APIRouter()
 
@@ -17,9 +20,25 @@ async def list_events(client: deps.RedisDep) -> list[schemas.Event]:
 @router.get("/{id}/brackets")
 async def event_brackets(id: deps.EventId, client: deps.RedisDep) -> schemas.EventBrackets:
     """Return Riot's bracket layout for an event, with a status saying what it does not cover."""
-    return await brackets.event_brackets(id, client)
+    requested = id
+    if utils.is_riot_tournament_id(id):
+        # Without the database the tournament's own brackets still answer, marked unavailable when unread.
+        with contextlib.suppress(ServiceUnavailableError):
+            id = await riot_events.vlr_event_for(id) or id
+    shown = await brackets.event_brackets(id, client)
+    shown.event_id = requested  # a client files the answer under the id it asked for
+    return shown
 
 
 @router.get("/{id}")
 async def event_by_id(id: str, client: deps.RedisDep) -> schemas.EventWithDetails:
-    return await events.get_event_by_id(id, client)
+    """Return an event by VLR event id or Riot tournament id."""
+    requested = id
+    if utils.is_riot_tournament_id(id):
+        if (vlr_id := await riot_events.vlr_event_for(id)) is None:
+            return await riot_events.event_with_details(id, client)
+        id = vlr_id
+    event = await events.get_event_by_id(id, client)
+    await match_refs.keep_ids(event.matches)
+    event.id = requested  # a client files the event under the id it asked for, also once VLR lists it
+    return event

@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import constants
 from app.constants import FavoriteType, Platform
-from app.db.models import Client, DeviceToken, Favorite, LiveActivityStart, MatchPushState
+from app.db.models import Client, DeviceToken, Favorite, LiveActivityStart, MatchPushState, MatchRecord, RiotWebMatch
 from app.exceptions import NotFoundError
 from app.schemas.matches import Favorites
 from app.services.push import Routing
@@ -157,10 +157,24 @@ class SubscriptionStore:
         :param routing: The match routing IDs.
         :return: SQL predicate matching any favorite for the match.
         """
-        clauses = [(Favorite.entity_type == FavoriteType.MATCH.value) & (Favorite.entity_id == routing.match_id)]
+        # A match is favorited under whichever of its ids the client held, so any of them counts.
+        own_ids = [
+            select(MatchRecord.id).where(MatchRecord.vlr_id == routing.match_id),
+            select(MatchRecord.riot_id).where(MatchRecord.vlr_id == routing.match_id, MatchRecord.riot_id.is_not(None)),
+            select(RiotWebMatch.riot_id).where(RiotWebMatch.vlr_match_id == routing.match_id),
+        ]
+        clauses = [
+            (Favorite.entity_type == FavoriteType.MATCH.value)
+            & or_(Favorite.entity_id == routing.match_id, *(Favorite.entity_id.in_(ids) for ids in own_ids))
+        ]
         if routing.event_id:
+            # An event favorited as a Riot-created one, by its tournament id, is this event once VLR lists it.
+            tournaments = select(RiotWebMatch.tournament_id).where(
+                RiotWebMatch.vlr_event_id == routing.event_id, RiotWebMatch.tournament_id.is_not(None)
+            )
             clauses.append(
-                (Favorite.entity_type == FavoriteType.EVENT.value) & (Favorite.entity_id == routing.event_id)
+                (Favorite.entity_type == FavoriteType.EVENT.value)
+                & or_(Favorite.entity_id == routing.event_id, Favorite.entity_id.in_(tournaments))
             )
         if routing.team_ids:
             clauses.append((Favorite.entity_type == FavoriteType.TEAM.value) & Favorite.entity_id.in_(routing.team_ids))
@@ -215,6 +229,19 @@ class SubscriptionStore:
             return False
         self._session.add(LiveActivityStart(client_id=client_id, match_id=match_id))
         return True
+
+    async def shown_match_id(self, match_id: str) -> str:
+        """Name the id clients know a VLR match by.
+
+        :param match_id: VLR match id.
+        :return: The Riot series id of a match that was first listed from Riot, else the VLR id.
+        """
+        riot_id = await self._session.scalar(
+            select(MatchRecord.id)
+            .join(RiotWebMatch, RiotWebMatch.riot_id == MatchRecord.id)
+            .where(RiotWebMatch.vlr_match_id == match_id)
+        )
+        return riot_id or match_id
 
     async def live_android_tokens(self, routing: Routing) -> list[str]:
         """Find FCM tokens for Android clients following the match with live updates enabled.

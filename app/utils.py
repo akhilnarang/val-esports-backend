@@ -1,14 +1,59 @@
+import re
+import unicodedata
 from collections.abc import Iterable
 from datetime import datetime
 from urllib.parse import urljoin, urlparse, urlsplit
 from zoneinfo import ZoneInfo
 
 from app import constants
-from app.constants import PREFIX
+from app.constants import ID_REGEX, PREFIX, TOURNAMENT_ID_REGEX
 from app.core.config import settings
 
 _TZ_LOCAL = ZoneInfo(settings.TIMEZONE)
 _TZ_UTC = ZoneInfo("UTC")
+
+
+def normalize_name(name: str) -> str:
+    """Fold a team name to lowercase ASCII letters and digits, so accents, spaces and punctuation don't matter.
+
+    :param name: Team name, tag, or id_map key.
+    :return: The folded name (e.g. "KRÜ Esports" -> "kruesports").
+    """
+    return re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", name).lower())
+
+
+def is_vlr_event_id(value: str) -> bool:
+    """Check whether an event id is a VLR event id rather than a Riot-created one.
+
+    :param value: Event id.
+    :return: True for 1-10 digits.
+    """
+    return re.fullmatch(ID_REGEX, value) is not None
+
+
+def is_riot_tournament_id(value: str | None) -> bool:
+    """Check whether a value can serve as a Riot tournament id and so as a Riot-created event id.
+
+    :param value: Candidate id.
+    :return: True for 11-20 digits.
+    """
+    return value is not None and re.fullmatch(TOURNAMENT_ID_REGEX, value) is not None
+
+
+def format_event_dates(start: datetime, end: datetime | None) -> str:
+    """Format an event's window the way VLR does, such as ``Apr 1 – May 18, 2026``.
+
+    :param start: First day.
+    :param end: Last day, or None when unknown.
+    :return: The text; a one-day or same-month window is shortened.
+    """
+    if end is None or end.date() == start.date():
+        return f"{start:%b} {start.day}, {start.year}"
+    if start.year != end.year:
+        return f"{start:%b} {start.day}, {start.year} – {end:%b} {end.day}, {end.year}"
+    if start.month != end.month:
+        return f"{start:%b} {start.day} – {end:%b} {end.day}, {end.year}"
+    return f"{start:%b} {start.day} – {end.day}, {end.year}"
 
 
 def is_live(status: str | None) -> bool:
