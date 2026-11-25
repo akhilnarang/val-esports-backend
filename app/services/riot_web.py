@@ -44,7 +44,7 @@ from app.schemas.riot_web import (
     StoredVod,
     Tournament,
 )
-from app.services import matches, riot_web_link, riot_web_store
+from app.services import matches, ranking_store, riot_web_link, riot_web_store
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +153,7 @@ def stored_details(details: EventDetails) -> StoredDetails:
         games.append(StoredGame(number=game.number, state=game.state, vods=vods))
     return StoredDetails(
         tournament_id=details.tournament.id,
-        game_wins={team.name: team.result.game_wins if team.result else 0 for team in details.match.teams},
+        game_wins={team.name.strip(): team.result.game_wins if team.result else 0 for team in details.match.teams},
         games=games,
     )
 
@@ -287,6 +287,7 @@ async def refresh_schedule(sessions: Sessions, redis: Redis) -> str | None:
             await riot_web_store.fill_event_ids(
                 session, {match.id: match.event_id for match in listing if match.event_id}
             )
+            await ranking_store.keep_listed(session, listing, now)
     except SQLAlchemyError:
         logger.warning("could not store Riot web links", exc_info=True)
         return None
@@ -294,7 +295,10 @@ async def refresh_schedule(sessions: Sessions, redis: Redis) -> str | None:
 
 
 async def refresh_details(sessions: Sessions, redis: Redis) -> str | None:
-    """Fetch the details of linked series that are due, and store their per-map VOD offsets.
+    """Fetch the details of series that are due, and store their per-map VOD offsets and tournament ids.
+
+    A linked series is due while it is new; an unlinked one three days before it starts, hourly while it
+    runs, and once after it settles (see :func:`app.services.riot_web_store.details_due`).
 
     Every id is fetched before any write, so no transaction is held across network I/O. The run
     stops fetching on a rejected key or a rate limit, because every later call would fail the same

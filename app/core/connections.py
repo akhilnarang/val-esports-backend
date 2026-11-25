@@ -77,3 +77,22 @@ async def get_http_client() -> AsyncIterator[httpx2.AsyncClient]:
             event_hooks={"request": [rotate_user_agent]},
         ) as client:
             yield client
+
+
+@asynccontextmanager
+async def reading_session(session: AsyncSession | None = None) -> AsyncIterator[AsyncSession]:
+    """Use the request's session when there is one, else a short one of its own.
+
+    A request that already holds a pooled connection never waits for a second one.
+
+    :param session: The request's session, if it has one.
+    :return: A session to read with.
+    :raises OSError: When there is no session and the database is not configured.
+    """
+    if session is not None:
+        yield session
+        return
+    if subscription_sessions is None:
+        raise OSError("database is unavailable")
+    async with subscription_sessions() as own:
+        yield own

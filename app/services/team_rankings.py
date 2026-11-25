@@ -11,10 +11,10 @@ from datetime import date, datetime, timedelta
 from itertools import groupby
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import delete
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import schemas
+from app import schemas, utils
 from app.constants import (
     ELO_ALGORITHM,
     ELO_BASE,
@@ -25,7 +25,9 @@ from app.constants import (
     RANKING_ACTIVE_DAYS,
     RANKING_MIN_MATCHES,
     RANKING_WINDOW_DAYS,
+    RIOT_WEB_LINK_FALLBACK_WINDOW,
     Circuit,
+    MatchSource,
     PredictionFallbackReason,
     PredictionRating,
     RankingOrder,
@@ -33,12 +35,13 @@ from app.constants import (
     RankingSort,
     Region,
 )
-from app.db.models import EventRecord, MapRecord, MatchRecord, Team, TeamCircuit, TeamElo
+from app.db.models import EventRecord, MapRecord, MatchRecord, RiotWebMatch, Team, TeamCircuit, TeamElo
 from app.exceptions import NotFoundError
 from app.schemas.matches import TeamWithImage
 from app.schemas.predictions import EloFallbackWarning, EloPredictionSource
-from app.services import predictions, ranking_store, scrape_store
+from app.services import predictions, ranking_store, riot_web_store, scrape_store
 from app.services.events import tier_event_circuits
+from app.services.riot_web_link import is_game_changers
 
 logger = logging.getLogger(__name__)
 
@@ -795,6 +798,55 @@ def _update_match(
     return changed
 
 
+async def _adoptable(session: AsyncSession, vlr_id: str) -> MatchRecord | None:
+    """Find the Riot-only row of the series linked to a VLR match, which VLR then adopts.
+
+    :param session: Caller-owned database session.
+    :param vlr_id: VLR match ID.
+    :return: The Riot-only row, or None when no linked series has one.
+    """
+    return await session.scalar(
+        select(MatchRecord)
+        .join(RiotWebMatch, RiotWebMatch.riot_id == MatchRecord.riot_id)
+        .where(RiotWebMatch.vlr_match_id == vlr_id, MatchRecord.vlr_id.is_(None))
+    )
+
+
+async def _riot_only_twin(
+    session: AsyncSession, team_a_id: str | None, team_b_id: str | None, starts: datetime
+) -> MatchRecord | None:
+    """Find the one Riot-only row of the same two teams that started within six hours of a VLR match.
+
+    A link that was never stored (a name Riot and VLR spell differently) would otherwise leave the
+    series in the ledger twice. Judged on start times, so a match across midnight is still found and
+    a rematch the next day is not.
+
+    :param session: Caller-owned database session.
+    :param team_a_id: First VLR team id, None while VLR shows TBD.
+    :param team_b_id: Second VLR team id.
+    :param starts: The VLR match's start.
+    :return: The Riot-only row, or None when there is none or more than one.
+    """
+    if not team_a_id or not team_b_id:
+        return None
+    rows = (
+        await session.scalars(
+            select(MatchRecord)
+            .join(RiotWebMatch, RiotWebMatch.riot_id == MatchRecord.riot_id)
+            .where(
+                MatchRecord.vlr_id.is_(None),
+                RiotWebMatch.vlr_match_id.is_(None),
+                RiotWebMatch.start_time.between(
+                    starts - RIOT_WEB_LINK_FALLBACK_WINDOW, starts + RIOT_WEB_LINK_FALLBACK_WINDOW
+                ),
+                ((MatchRecord.team_a_id == team_a_id) & (MatchRecord.team_b_id == team_b_id))
+                | ((MatchRecord.team_a_id == team_b_id) & (MatchRecord.team_b_id == team_a_id)),
+            )
+        )
+    ).all()
+    return rows[0] if len(rows) == 1 else None
+
+
 async def ingest_match(
     session: AsyncSession, match_id: str, details: schemas.MatchWithDetails, circuit: Circuit
 ) -> bool:
@@ -830,37 +882,48 @@ async def ingest_match(
         and item.teams[1].score is not None
         and item.teams[0].score != item.teams[1].score
     ]
-    stored = await session.get(MatchRecord, match_id)
+    stored = await session.scalar(select(MatchRecord).where(MatchRecord.vlr_id == match_id))
     if stored is None:
-        session.add(
-            MatchRecord(
-                id=match_id,
-                event_id=details.event.id,
-                stage=details.event.stage,
-                played_on=played_on,
-                team_a_id=team_a.id,
-                team_b_id=team_b.id,
-                team_a_score=team_a.score,
-                team_b_score=team_b.score,
-                patch=details.event.patch,
-                source="vlr",
-                ingested_at=int(time.time()),
-            )
+        stored = await _adoptable(session, match_id)
+        claimed = await session.scalar(select(RiotWebMatch.riot_id).where(RiotWebMatch.vlr_match_id == match_id))
+        # A series already linked to this match is its Riot side; only an unclaimed match looks for a twin.
+        if stored is None and claimed is None and details.event.date is not None:
+            stored = await _riot_only_twin(session, team_a.id, team_b.id, details.event.date)
+            if stored is not None:
+                # Store the link the schedule cron missed, or the next mirroring would clear the series id.
+                await riot_web_store.link_series(session, stored.riot_id, match_id, details.event.id)
+        if stored is not None:
+            stored.vlr_id = match_id
+    if stored is None:
+        stored = MatchRecord(
+            id=match_id,
+            vlr_id=match_id,
+            event_id=details.event.id,
+            stage=details.event.stage,
+            played_on=played_on,
+            team_a_id=team_a.id,
+            team_b_id=team_b.id,
+            team_a_score=team_a.score,
+            team_b_score=team_b.score,
+            patch=details.event.patch,
+            source=MatchSource.VLR,
+            ingested_at=int(time.time()),
         )
+        session.add(stored)
         await session.flush()
         session.add_all(
             [
-                MapRecord(match_id=match_id, map_index=index, name=name, team_a_score=score_a, team_b_score=score_b)
+                MapRecord(match_id=stored.id, map_index=index, name=name, team_a_score=score_a, team_b_score=score_b)
                 for index, name, score_a, score_b in maps
             ]
         )
         return True
     changed = _update_match(stored, details, played_on, team_a, team_b)
     for index, name, score_a, score_b in maps:
-        stored_map = await session.get(MapRecord, (match_id, index))
+        stored_map = await session.get(MapRecord, (stored.id, index))
         if stored_map is None:
             session.add(
-                MapRecord(match_id=match_id, map_index=index, name=name, team_a_score=score_a, team_b_score=score_b)
+                MapRecord(match_id=stored.id, map_index=index, name=name, team_a_score=score_a, team_b_score=score_b)
             )
             changed = True
         elif (stored_map.name, stored_map.team_a_score, stored_map.team_b_score) != (name, score_a, score_b):
@@ -871,7 +934,7 @@ async def ingest_match(
         obsolete = await session.execute(
             delete(MapRecord)
             .where(
-                MapRecord.match_id == match_id,
+                MapRecord.match_id == stored.id,
                 MapRecord.map_index > max(index for index, *_ in maps),
             )
             .returning(MapRecord.map_index)
@@ -879,6 +942,82 @@ async def ingest_match(
         if obsolete.first() is not None:
             changed = True
     return changed
+
+
+async def ingest_riot_series(session: AsyncSession, series: RiotWebMatch) -> bool:
+    """Store a settled Riot series no VLR match claimed as a Riot-only match, rated on its series outcome.
+
+    Needs both teams mirrored to VLR teams by Riot name, a decisive stored series score and a Riot
+    tournament id. A tournament no VLR event is known for is ledgered under a Riot-created event whose
+    id is the tournament id, written only together with the match; one that several VLR events are
+    known for is skipped. Anything missing returns False and the next run tries again. It also returns False when the series turned out to be linked, already stored, or
+    the same pairing as a VLR match on the same or an adjacent day, so a series is rated once.
+    No maps are stored: Riot gives no map names or scores.
+
+    :param session: Caller-owned database session.
+    :param series: A series from :func:`app.services.riot_web_store.settled_unlinked`.
+    :return: True when a match was added.
+    """
+    if (details := riot_web_store.read_details(series)) is None:
+        return False
+    if is_game_changers(series.league_name):
+        # Riot names a Game Changers roster like its main roster, which is the one paired by Riot name.
+        return False
+    names = [team["name"].strip() for team in series.teams]
+    wins = {name.strip(): count for name, count in details.game_wins.items()}
+    needed = (series.best_of or 1) // 2 + 1  # a paused or abandoned series is not decided by its lead
+    if len(names) != 2 or names[0] == names[1] or set(wins) != set(names) or max(wins.values()) < needed:
+        return False
+    await riot_web_store.pair_unmapped_teams(session, names)
+    mirrored = await riot_web_store.mirrored_teams(session)
+    if any(utils.normalize_name(name) not in mirrored for name in names):
+        return False
+    team_a_id, team_b_id = (mirrored[utils.normalize_name(name)].id for name in names)
+    tournament_id = series.tournament_id
+    if team_a_id == team_b_id or tournament_id is None or not utils.is_riot_tournament_id(tournament_id):
+        return False
+    event_ids = (await riot_web_store.events_by_tournament(session, [tournament_id])).get(tournament_id, set())
+    if len(event_ids) > 1:
+        return False
+    if event_ids:
+        if await session.get(EventRecord, event_id := next(iter(event_ids))) is None:
+            return False
+    else:
+        event_id = tournament_id
+    played_on = series.start_time.astimezone(_MATCH_TZ).date()
+    taken = await session.scalar(
+        select(func.count())
+        .select_from(MatchRecord)
+        .where(
+            or_(
+                (MatchRecord.riot_id == series.riot_id) & (MatchRecord.id != series.riot_id),
+                (MatchRecord.vlr_id.is_not(None))
+                & (MatchRecord.played_on.between(played_on - timedelta(days=1), played_on + timedelta(days=1)))
+                & (
+                    ((MatchRecord.team_a_id == team_a_id) & (MatchRecord.team_b_id == team_b_id))
+                    | ((MatchRecord.team_a_id == team_b_id) & (MatchRecord.team_b_id == team_a_id))
+                ),
+            )
+        )
+    )
+    linked = await session.scalar(select(RiotWebMatch.vlr_match_id).where(RiotWebMatch.riot_id == series.riot_id))
+    # The row the match list showed the series by, which only lacks its result.
+    row = await session.get(MatchRecord, series.riot_id)
+    if taken or linked is not None or (row is not None and (row.vlr_id or row.team_a_score is not None)):
+        return False
+    if not event_ids:
+        await ranking_store.ensure_riot_event(session, tournament_id, series.league_name, Circuit.OTHER)
+        await session.flush()
+    if row is None:
+        row = MatchRecord(id=series.riot_id, source=MatchSource.RIOT_WEB)
+        session.add(row)
+    row.riot_id = series.riot_id
+    row.event_id = event_id
+    row.played_on = played_on
+    row.team_a_id, row.team_b_id = team_a_id, team_b_id
+    row.team_a_score, row.team_b_score = wins[names[0]], wins[names[1]]
+    row.ingested_at = int(time.time())
+    return True
 
 
 async def resolve_event_circuit(session: AsyncSession, event_id: str, name: str) -> Circuit:

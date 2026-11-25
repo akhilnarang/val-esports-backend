@@ -83,8 +83,9 @@ async def deliver_start(
         if created_channel:
             await store.save_match(match_id, channel_id, state.semantic())
         await store.mark_started(client_id, match_id)
+        shown = state.model_copy(update={"match_id": await store.shown_match_id(match_id)})
     try:
-        await client.send_start(token, channel_id, state)
+        await client.send_start(token, channel_id, shown)
     except APNsError as exc:
         logger.warning("APNs start failed for client %s, match %s: %s", client_id, match_id, exc.reason)
         if exc.reason in constants.DEAD_TOKEN_REASONS:

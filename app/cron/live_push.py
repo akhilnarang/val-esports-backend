@@ -615,6 +615,7 @@ async def _push_match(
         await session.commit()  # end the transaction before any provider call
     routing = push.routing_ids(match_id, detail)
     tokens = await store.live_android_tokens(routing) if fcm_app is not None else []
+    shown = await _shown(store, state)
     await session.commit()  # finish the token read before the provider send
 
     if state.terminal:
@@ -627,7 +628,7 @@ async def _push_match(
             sent = await _send_fcm(tokens, fcm_app, state)
         if row is not None and row.channel_id:
             # A card for a match with no play is dismissed now instead of after the usual delay.
-            await _end_apns(row.channel_id, state, immediate_dismissal=unstarted)
+            await _end_apns(row.channel_id, shown, immediate_dismissal=unstarted)
         await store.delete_match(match_id)
         await session.commit()  # the push-state cleanup must be durable before the optional live copy
         await _delete_live_copy(session, match_id)
@@ -726,6 +727,7 @@ async def _end_unavailable_match(
     # Only matches with an APNs channel have a stored score; Android-only rows are just removed.
     if row.last_state_json is not None:
         state = push.final_from_last_sent(row.last_state_json)
+        shown = await _shown(store, state)
         if _unstarted(state):
             # Terminal or not, a scoreless state would announce a fake "FINAL 0-0" for a match that never played.
             logger.warning("dropping match %s without a final push: its last state has no play", match_id)
@@ -735,7 +737,7 @@ async def _end_unavailable_match(
             await _delete_live_copy(session, match_id)
             if channel_id:
                 # End the activity now, so the scoreless pre-match card does not linger on the screen.
-                await _end_apns(channel_id, state, immediate_dismissal=True)
+                await _end_apns(channel_id, shown, immediate_dismissal=True)
             return
         # Without the match page, event and player IDs are unknown; the stored teams still carry theirs.
         team_ids = [team.id for team in state.teams if team.id]
@@ -744,7 +746,7 @@ async def _end_unavailable_match(
         await session.commit()  # finish the token read before the provider send
         await _send_fcm(tokens, fcm_app, state)
         if row.channel_id:
-            await _end_apns(row.channel_id, state)
+            await _end_apns(row.channel_id, shown)
     await store.delete_match(match_id)
     await session.commit()  # the push-state cleanup must be durable before the optional live copy
     await _delete_live_copy(session, match_id)
@@ -785,6 +787,19 @@ async def _send_fcm(tokens: list[str], fcm_app: App | None, state: CompactState,
     return True
 
 
+async def _shown(store: SubscriptionStore, state: CompactState) -> CompactState:
+    """Give a state the match id iOS clients know the match by.
+
+    Push state is keyed by VLR id. A match first listed from Riot is known by its Riot series id, so
+    what an activity is sent carries that id.
+
+    :param store: Subscription store.
+    :param state: Compact score state under its VLR id.
+    :return: The state to send to APNs.
+    """
+    return state.model_copy(update={"match_id": await store.shown_match_id(state.match_id)})
+
+
 async def _end_apns(channel_id: str, state: CompactState, *, immediate_dismissal: bool = False) -> None:
     """Send the final state to the APNs channel and delete it, logging any failure.
 
@@ -823,6 +838,7 @@ async def _push_apns(
     :raises SQLAlchemyError: If a database operation fails.
     """
     starts = await store.pending_starts(routing)
+    shown = await _shown(store, state)
     await session.commit()  # finish the start query before the provider calls
     channel_id = row.channel_id if row is not None else None
     last_state = row.last_state_json if row is not None else None
@@ -840,13 +856,13 @@ async def _push_apns(
         return True
 
     for client_id, token in starts:
-        await _start_activity(store, session, apns, client_id, token, channel_id, state)
+        await _start_activity(store, session, apns, client_id, token, channel_id, state, shown)
 
     # A start that was already recorded leaves its read transaction open, and the broadcast must not hold one.
     await session.commit()
     if state.semantic() != last_state:
         try:
-            await apns.publish(channel_id, state, terminal=False)
+            await apns.publish(channel_id, shown, terminal=False)
             await store.save_match(state.match_id, channel_id, state.semantic())
         except Exception:
             logger.warning("APNs update failed for match %s", state.match_id, exc_info=True)
@@ -862,6 +878,7 @@ async def _start_activity(
     token: str,
     channel_id: str,
     state: CompactState,
+    shown: CompactState,
 ) -> None:
     """Send one push-to-start at most once per client and match.
 
@@ -872,6 +889,7 @@ async def _start_activity(
     :param token: APNs push-to-start token.
     :param channel_id: APNs broadcast channel the activity listens on.
     :param state: Compact score state.
+    :param shown: The state as the device gets it, from :func:`_shown`.
     :return: None.
     :raises SQLAlchemyError: If a database operation fails.
     """
@@ -879,7 +897,7 @@ async def _start_activity(
         return
     await session.commit()
     try:
-        await apns.send_start(token, channel_id, state)
+        await apns.send_start(token, channel_id, shown)
     except APNsError as exc:
         if exc.reason in _DEAD_TOKEN_REASONS:
             await store.clear_token(token)

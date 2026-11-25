@@ -2,7 +2,7 @@
 
 from datetime import date, datetime
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Index, String, Text, UniqueConstraint, text
+from sqlalchemy import CheckConstraint, DateTime, Enum, ForeignKey, Index, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -44,7 +44,7 @@ class Favorite(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     client_id: Mapped[str] = mapped_column(ForeignKey("clients.id", ondelete="CASCADE"), index=True)
     entity_type: Mapped[str] = mapped_column(String(16), index=True)
-    entity_id: Mapped[str] = mapped_column(String(10), index=True)
+    entity_id: Mapped[str] = mapped_column(String(20), index=True)  # a match is kept under the id it was favorited by
 
 
 class MatchPushState(Base):
@@ -127,11 +127,11 @@ class IdMapping(Base):
 
 
 class EventRecord(Base):
-    """A VLR event whose matches are in the ranking ledger."""
+    """An event whose matches are in the ranking ledger: a VLR event, or a Riot-created one whose id is a Riot tournament id."""
 
     __tablename__ = "events"
 
-    id: Mapped[str] = mapped_column(String(10), primary_key=True)
+    id: Mapped[str] = mapped_column(String(20), primary_key=True)
     name: Mapped[str] = mapped_column(Text)
     circuit: Mapped[Circuit] = mapped_column(
         Enum(Circuit, native_enum=False, length=16, values_callable=lambda enum: [member.value for member in enum]),
@@ -142,12 +142,25 @@ class EventRecord(Base):
 
 
 class MatchRecord(Base):
-    """A completed match in the ranking ledger; team IDs are NULL when VLR shows TBD."""
+    """A completed match in the ranking ledger; team IDs are NULL when VLR shows TBD.
+
+    A row is VLR-sourced (``vlr_id`` only), Riot-only (``riot_id`` only) or merged (both).
+    ``id`` is the id of the provider the row was created from: its VLR id, or its Riot series id
+    (longer, so the two never collide). It never changes, so a Riot-only row VLR later adopts keeps
+    its Riot id as ``id`` and gains ``vlr_id``.
+    """
 
     __tablename__ = "matches"
+    __table_args__ = (
+        UniqueConstraint("vlr_id", name="uq_matches_vlr_id"),
+        UniqueConstraint("riot_id", name="uq_matches_riot_id"),
+        CheckConstraint("vlr_id IS NOT NULL OR riot_id IS NOT NULL", name="ck_matches_has_provider_id"),
+    )
 
-    id: Mapped[str] = mapped_column(String(10), primary_key=True)
-    event_id: Mapped[str] = mapped_column(ForeignKey("events.id"), index=True)
+    id: Mapped[str] = mapped_column(String(20), primary_key=True)
+    vlr_id: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    riot_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    event_id: Mapped[str] = mapped_column(String(20), ForeignKey("events.id"), index=True)
     stage: Mapped[str | None] = mapped_column(Text, nullable=True)
     played_on: Mapped[date] = mapped_column(index=True)
     team_a_id: Mapped[str | None] = mapped_column(ForeignKey("teams.id"), nullable=True)
@@ -164,7 +177,7 @@ class MapRecord(Base):
 
     __tablename__ = "maps"
 
-    match_id: Mapped[str] = mapped_column(ForeignKey("matches.id"), primary_key=True)
+    match_id: Mapped[str] = mapped_column(String(20), ForeignKey("matches.id"), primary_key=True)
     map_index: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(Text)
     team_a_score: Mapped[int] = mapped_column()
@@ -199,7 +212,7 @@ class RankingResult(Base):
     )
 
     seq: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    match_id: Mapped[str] = mapped_column(ForeignKey("matches.id"))
+    match_id: Mapped[str] = mapped_column(String(20), ForeignKey("matches.id"))
     scope: Mapped[RankingScope] = mapped_column(
         Enum(RankingScope, native_enum=False, length=8, values_callable=lambda enum: [member.value for member in enum])
     )

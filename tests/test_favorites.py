@@ -12,6 +12,7 @@ from app.api.v1.endpoints.favorites import router
 from app.core import connections
 from app.cron import favorite_players
 from app.db.migrations import upgrade_to_head
+from app.db.models import RiotWebMatch
 from app.schemas.matches import Favorites
 from app.schemas.player import PlayerTeam
 from app.services.subscription_store import SubscriptionStore
@@ -42,7 +43,20 @@ async def test_favorite_matches_follow_teams_players_events_and_matches(monkeypa
     monkeypatch.setattr(connections, "subscription_sessions", sessions)
     async with sessions.begin() as session:
         await SubscriptionStore(session).add_favorites(
-            CLIENT_ID, Favorites(teams=["624"], events=["2766"], players=["9"], matches=["800"])
+            CLIENT_ID,
+            Favorites(teams=["624"], events=["112053399716844250"], players=["9"], matches=["115576361461208999"]),
+        )
+        # Favorited under its Riot id, before VLR listed it as match 800; its event likewise, before VLR's 2766.
+        session.add(
+            RiotWebMatch(
+                riot_id="115576361461208999",
+                start_time=START + timedelta(hours=40),
+                league_name="Champions",
+                teams=[{"name": "T10"}, {"name": "T11"}],
+                vlr_match_id="800",
+                vlr_event_id="2766",
+                tournament_id="112053399716844250",
+            )
         )
 
     listed = [

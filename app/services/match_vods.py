@@ -53,7 +53,7 @@ async def map_vods(match_id: str, details: MatchWithDetails) -> list[MapVods]:
         return []
     if stored is None or not _aligned(details, stored):
         return []
-    by_map = _links_by_map(stored)
+    by_map = vods_by_map(stored)
     return [
         MapVods(map_number=item.number, links=by_map[item.number]) for item in details.data if by_map.get(item.number)
     ]
@@ -96,7 +96,7 @@ def _scores_agree(details: MatchWithDetails, stored: StoredDetails) -> bool:
     return len(matched) == len(riot)
 
 
-def _links_by_map(stored: StoredDetails) -> dict[int, list[VodLink]]:
+def vods_by_map(stored: StoredDetails) -> dict[int, list[VodLink]]:
     """Build every completed map's playable links, dropping maps that have none.
 
     :param stored: The linked series' stored details.

@@ -4,10 +4,20 @@ import time
 from datetime import datetime
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, Field, HttpUrl, ValidationError, computed_field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    HttpUrl,
+    ValidationError,
+    ValidationInfo,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 from app import i18n
 from app.constants import (
+    EVENT_REF_REGEX,
     ID_REGEX,
     LIVE_STATUSES,
     MAX_FAVORITES_PER_GROUP,
@@ -479,13 +489,17 @@ class Favorites(BaseModel):
 
     @field_validator("teams", "matches", "players", "events")
     @classmethod
-    def validate_ids(cls, values: list[str]) -> list[str]:
-        """Reject nonnumeric or out-of-range favorite IDs.
+    def validate_ids(cls, values: list[str], info: ValidationInfo) -> list[str]:
+        """Reject malformed favorite IDs.
 
         :param values: IDs for a favorite group.
+        :param info: Which group is being validated.
         :return: Validated IDs.
-        :raises ValueError: If an ID is not a positive ASCII integer.
+        :raises ValueError: If an ID is not a positive ASCII integer: up to 10 digits for a team or
+            player, up to 20 for a match or event, which can be Riot's.
         """
-        if any(not re.fullmatch(ID_REGEX, value) for value in values):
+        # A Riot-only match and a Riot-created event are opened, and so favorited, by their Riot ids.
+        pattern = EVENT_REF_REGEX if info.field_name in ("matches", "events") else ID_REGEX
+        if any(not re.fullmatch(pattern, value) for value in values):
             raise ValueError("favorite IDs must be positive ASCII digits")
         return values

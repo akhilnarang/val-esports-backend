@@ -22,9 +22,7 @@ Usage (where the app runs, from the repo root):
 import asyncio
 import io
 import json
-import re
 import sys
-import unicodedata
 from pathlib import Path
 
 import httpx2
@@ -36,6 +34,7 @@ from app.constants import IdMapKind
 from app.core.config import settings
 from app.db.models import IdMapping, Team
 from app.services import scrape_store
+from app.utils import normalize_name as normalize
 
 API = "https://esports-api.service.valorantesports.com/persisted/val/getSchedule"
 LEAGUES = {
@@ -50,20 +49,13 @@ DEFAULT_CDN_BASE_URL = "https://files.akhilnarang.dev/cdn/valorant/"
 MAX_SIZE = 512
 # Riot code -> VLR team ID, for teams whose Riot name differs from VLR's and whose VLR tag isn't stored yet.
 OVERRIDES = {
+    "FPX": "11328",  # FunPlus Phoenix
+    "G2": "11058",  # G2 Esports
     "KRU": "2355",  # KRÜ Esports
     "LEV": "2359",  # Leviatán
     "NAVI": "4915",  # Natus Vincere
     "TYL": "731",  # TYLOO
 }
-
-
-def normalize(name: str) -> str:
-    """Fold a team name to lowercase ASCII letters and digits, so accents, spaces and punctuation don't matter.
-
-    :param name: Team name, tag, or id_map key.
-    :return: The folded name (e.g. "KRÜ Esports" -> "kruesports").
-    """
-    return re.sub(r"[^a-z0-9]", "", unicodedata.normalize("NFKD", name).lower())
 
 
 def unique_index(pairs: list[tuple[str, str]]) -> dict[str, str]:

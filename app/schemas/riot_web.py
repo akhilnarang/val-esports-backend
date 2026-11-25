@@ -20,7 +20,7 @@ from pydantic import (
 )
 from pydantic.alias_generators import to_camel
 
-from app.constants import RiotGameState, RiotMatchState, VodProvider
+from app.constants import RIOT_ID_REGEX, RiotGameState, RiotMatchState, VodProvider
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,8 @@ class ScheduleStrategy(RiotWebPayload):
 
 
 class ScheduleMatch(RiotWebPayload):
-    id: str = Field(pattern=r"^\d{1,20}$")
+    # Clients tell a series id from a VLR id by its length, so one of another shape is not stored.
+    id: str = Field(pattern=RIOT_ID_REGEX)
     teams: list[ScheduleTeam] = Field(min_length=2, max_length=2)
     strategy: ScheduleStrategy | None = None
 
@@ -261,6 +262,7 @@ class Tournament(RiotWebPayload):
 
     name: str
     start_time: AwareDatetime | None = None
+    end_time: AwareDatetime | None = None
     stages: list[StandingsStage]
 
 

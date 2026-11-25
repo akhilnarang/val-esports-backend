@@ -16,9 +16,9 @@ Most endpoints are public. Some internal endpoints may require `X-API-Key` heade
 |--------|----------|-------------|
 | GET | `/events` | List events with optional status filtering |
 | GET | `/events/{id}` | Get detailed event information |
-| GET | `/events/{id}/brackets` | Get Riot's bracket layout for an event |
+| GET | `/events/{id}/brackets` | Get Riot's bracket layout for an event (VLR event id or Riot tournament id) |
 | GET | `/matches` | List matches with filtering options |
-| GET | `/matches/{id}` | Get detailed match information |
+| GET | `/matches/{id}` | Get detailed match information by VLR id or Riot series id |
 | GET | `/matches/{id}/extra` | Get round-by-round Riot data for a match's maps |
 | GET | `/news` | Get latest news articles |
 | GET | `/news/{id}` | Get an article with ordered content blocks |
@@ -278,6 +278,41 @@ Article detail responses are scraped on request, unlike the cached news list.
 Clients with locally cached article bodies should fetch an article again when
 its cached response has no blocks.
 
+## Match ids
+
+Every match id is digits. `GET /matches/{id}` accepts a VLR match id (1 to 10 digits) or a Riot
+series id (11 to 20 digits, for example a bracket match's `id`); the length tells them apart, and a
+Riot id is looked up in the stored Riot series and the ledger. A match
+with a VLR id, including one reached through a linked Riot series id, returns exactly the
+VLR-backed response. A VLR-shaped id (1 to 10 digits) that no row holds is scraped from VLR as
+before; any other unknown id returns 404.
+
+`GET /matches` is VLR's list plus the Riot series VLR does not list: unlinked, within three days of
+now, with two named teams, a known Riot tournament and a known status, and given a `matches` row by the
+schedule cron (which skips one that has the same two teams as a listed VLR match within six hours). Each is a plain
+`Match` placed where its time puts it among VLR's entries, with `id` its Riot series id, `event` the
+league name, `event_id` its Riot tournament id (always an event `GET /events/{id}` serves, from VLR's event once VLR has it), and `series` the
+ledger stage or `""`. A match's id never changes: when VLR lists such a match later, VLR's entry is
+shown under the same Riot id, and its `event_id` stays the tournament id, here and in the favorites feed, event pages, team pages and player
+pages. An iOS Live Activity is started and updated under the Riot id as well. FCM messages are the exception:
+live scores and the starting-soon alert always carry the VLR id, because released Android apps drop a
+match id longer than 10 digits and the oldest one cannot parse it. A match with no VLR page has no
+pushes on either platform. Either id
+opens `GET /matches/{id}`, `GET /matches/{id}/extra` and `POST /clients/{client_id}/matches/{match_id}/live-activity`
+(the last two answer 404 for a match with no VLR page). A match can be favorited under either id; the
+favorites feed shows it under the id the list does, and push routing matches both ids of the match.
+The list is still served when the database cannot be read.
+
+A Riot-only match (no VLR page) returns the same shape, built from Riot's stored series: the
+teams carry Riot's names and series scores (a team mirrored to a VLR team also has its `id`
+and logo, otherwise `id` is null and `img` a placeholder), `event.series` is the league name,
+`event.id` is the VLR event when known, else the Riot tournament id (the id of its Riot-created event), and `""` only while no tournament is known, `event.status` is derived from the
+start time and Riot's game wins (and can be null), `total_maps` is the best-of, and `map_count`
+the games Riot marks completed. `bans`, `veto`, `previous_encounters`, `data`, `videos` and
+`insights` are empty, `map_vods` comes from Riot's stored VODs, and VLR does not cross-check
+any of it. The response is not cached. The v2 team profile's recent results include a rated
+Riot-only match, under its Riot id.
+
 ## Match map entries
 
 `GET /matches/{id}` returns `data` with one entry per game whose stats panel VLR has
@@ -398,14 +433,16 @@ Authorization: Bearer <api-key>
 
 Returns `204 No Content` on success (triggers an APNs push-to-start on iOS, or an immediate direct FCM message to the device on Android), `404` if the client has no registered token, and `400` if the match is not live.
 
-Invalid tokens (including a non-hex iOS token) or favorite IDs return `422 Unprocessable Entity`.
+Invalid tokens (including a non-hex iOS token) or favorite IDs return `422 Unprocessable Entity`. An event
+is favorited by its VLR id or, for a Riot-created event, its Riot tournament id.
 
 The one-minute job checks matches whose listing status is `live`. Android live scores
 are data-only, high-priority FCM messages sent directly to each follower's stored
 registration token; there is no topic fanout and no topic fallback. The legacy
 `match-`, `event-`, and `team-` topics carry only the "match starting soon" alert, because
 released app versions show every message on those as a notification; those installs keep
-getting just that alert. A matching iOS favorite creates one APNs broadcast
+getting just that alert. Its payload always carries the VLR match id; a match or event favorited by its Riot id is alerted
+through that id's topic as well. A match VLR does not list gets no such alert. A matching iOS favorite creates one APNs broadcast
 channel and one push-to-start request per client. A final state ends the Live
 Activity, which stays on the Lock Screen with the final score for four hours (the
 most ActivityKit allows) before the system dismisses it, and deletes the channel. A
@@ -469,3 +506,16 @@ No explicit rate limiting implemented. Please respect vlr.gg's servers and avoid
 
 ## Caching
 Endpoints use Redis caching with TTL. Cache keys are set by background cron jobs. See [Caching Documentation](caching.md) for details.
+
+## Riot-created events
+
+`GET /events/{id}` and `GET /events/{id}/brackets` accept a VLR event id or a Riot tournament id
+(11 to 20 digits). A tournament that exactly one VLR event is linked to is served from VLR's
+event, but `id` (and the brackets' `event_id`) stays the tournament id that was asked for, so a client
+files the answer under the id it holds. Any other tournament with a stored series is served as a
+Riot-created event: `id` is the tournament id, `title` and `dates` come from Riot's standings
+(Riot's scheduled UTC window; the stored series when Riot does not answer), `subtitle` is the
+league, `status` is derived from Riot's end time (`unknown` when it is unavailable and the stored
+series are all settled), and `prize`, `location` and `standings` are empty with a placeholder
+`img`. `teams` lists only teams mirrored to a VLR team, and `matches` has one entry per series without a TBD team, whose `id` is the one `GET /matches` shows for it: its Riot series id when the match was first listed from Riot, else its VLR match id; both open at `GET /matches/{id}`. A series that has neither a VLR link nor its own row is left out while it is under three days old, because a link could still change its id. A Game Changers series gets no team ids, because Riot names a Game Changers roster
+like its main roster. Brackets echo the tournament id as `event_id`. Riot's standings are cached for 60 seconds. These events are not returned by `GET /events` or search. One can be favorited by its tournament id; once VLR lists the event, that favorite counts for the VLR event in the favorites feed and push routing.

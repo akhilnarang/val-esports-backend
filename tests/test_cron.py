@@ -216,6 +216,9 @@ async def test_live_push_cron_applies_video_score_only_to_resolved_match(monkeyp
         async def live_android_tokens(self, routing):
             return [f"token:{routing.match_id}"]
 
+        async def shown_match_id(self, match_id):
+            return match_id
+
     details = {match_id: _live_detail("live", (0, 0)) for match_id in ("123", "456")}
     for detail in details.values():
         for team in detail.data[0].teams:
@@ -673,6 +676,9 @@ async def test_live_push_cron_drops_an_unstarted_match_without_a_final_push(monk
         async def live_android_tokens(self, routing):
             return ["fcm-token:APA91b"]
 
+        async def shown_match_id(self, match_id):
+            return match_id
+
         async def delete_match(self, match_id):
             deleted.append(match_id)
 
@@ -831,6 +837,10 @@ async def test_fcm_cron_sends_valid_matches_and_reports_failures():
     with (
         patch("app.cron.legacy_fcm.matches.get_upcoming_matches", AsyncMock(return_value=[valid_match, invalid_match])),
         patch("app.cron.legacy_fcm.matches.match_by_id", AsyncMock(side_effect=[match_details, error])),
+        patch(
+            "app.cron.legacy_fcm._riot_ids",
+            AsyncMock(return_value={"123": ("115576361461208999", "112053399716844250")}),
+        ),
         patch("app.cron.legacy_fcm.capture_exception") as capture_exception,
         patch("app.cron.legacy_fcm.get_app", return_value=firebase_app),
         patch("app.cron.legacy_fcm.messaging.send_each_async", AsyncMock()) as send_each_async,
@@ -842,10 +852,14 @@ async def test_fcm_cron_sends_valid_matches_and_reports_failures():
     await_args = send_each_async.await_args
     assert await_args is not None
     messages = await_args.kwargs["messages"]
-    assert len(messages) == 1
+    # A favorite stored under the match's Riot id, or its event's tournament id, is alerted too; a
+    # subscriber of both topics is not alerted twice, and the payload keeps the VLR id Android can take.
+    assert [message.data["match_id"] for message in messages] == ["123", "123"]
     assert messages[0].data["title"] == "Team A vs Team B"
-    assert messages[0].data["match_id"] == "123"
-    assert "'match-123' in topics" in messages[0].condition
+    assert "'match-123' in topics || " in messages[0].condition
+    assert messages[0].condition.endswith("'match-115576361461208999' in topics")
+    assert messages[1].condition.startswith("'event-112053399716844250' in topics && !('event-99' in topics")
+    assert all(message.condition.count(" in topics") <= 5 for message in messages)
     assert await_args.kwargs["app"] is firebase_app
 
 
@@ -2330,8 +2344,8 @@ async def test_riot_matches_downgrade_refuses_to_lose_unlinked_archive(make_data
         config = Config("alembic.ini")
         config.attributes["app"] = True
         config.set_main_option("sqlalchemy.url", database_url)
-        # The Riot web and archive changes are one revision, so "-1" leaves exactly its predecessor.
-        command.downgrade(config, "-1")
+        # The Riot web and archive changes are one revision; this leaves exactly its predecessor.
+        command.downgrade(config, "c41e7d2a9f03")
 
     try:
         async with engine.begin() as connection:

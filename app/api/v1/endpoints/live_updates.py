@@ -12,7 +12,7 @@ from app.api import deps
 from app.cron import synthetic_match
 from app.exceptions import BadRequestError, ConflictError, NotFoundError, ScrapingError
 from app.schemas.matches import CompactState, Favorites, MatchWithDetails, TokenRegistration
-from app.services import matches, push, video_rounds
+from app.services import match_refs, matches, push, video_rounds
 from app.services.subscription_store import SubscriptionStore
 from app.utils import is_live
 
@@ -64,11 +64,13 @@ async def get_favorites(client_id: UUID, store: deps.SubscriptionStoreDep) -> Fa
 )
 async def start_live_activity(
     client_id: UUID,
-    match_id: deps.MatchId,
+    match_id: deps.MatchRef,
+    session: deps.DatabaseSessionDep,
     store: deps.SubscriptionStoreDep,
     redis_client: deps.RedisDep,
 ) -> None:
     """Instantly trigger a live match push (APNs push-to-start for iOS, direct FCM message for Android)."""
+    match_id = await match_refs.vlr_id_of(match_id, session)
     token_row = await store.get_token(str(client_id))
     if token_row is None:
         raise NotFoundError("Client token not registered")

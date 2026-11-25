@@ -19,11 +19,11 @@ The application uses arq for background job scheduling to periodically update ca
 | Events | `events_cron` | Every 30 min | Update event listings |
 | News | `news_cron` | Every 30 min | Update news articles |
 | Standings | `standings_cron` | Daily 00:00 | Update current year standings |
-| Team Rankings | `team_rankings_cron` | Every 15 min | Upsert newly completed matches and rebuild the Elo ledger (`app/cron/team_rankings.py`) |
+| Team Rankings | `team_rankings_cron` | Every 15 min | Upsert newly completed matches, mirror Riot ids onto them, add settled Riot-only series, and rebuild the Elo ledger (`app/cron/team_rankings.py`) |
 | FCM Notifications | `fcm_notification_cron` | Every 15 min | Legacy "match starting soon" alert on the `match-`/`event-`/`team-` topics (`app/cron/legacy_fcm.py`) |
 | Live Matches | `live_push_cron` | Every minute | Send APNs/FCM scores for tracked matches (listed live, or already pushed); at most one run at a time (fixed arq `job_id`) |
 | Riot Web Schedule | `riot_web_schedule_cron` | Every 10 min at :01, :11, … | Store Riot's web schedule and link each series to its VLR match (`app/cron/riot_web.py`); runs when `RIOT_WEB_API_KEY` is set |
-| Riot Web Details | `riot_web_details_cron` | Every 10 min at :04, :14, … | Fetch `getEventDetails` for linked series that are due and have started: at most 30 a run, refreshed hourly, settled 48 hours after the start |
+| Riot Web Details | `riot_web_details_cron` | Every 10 min at :04, :14, … | Fetch `getEventDetails` for linked series that are due and have started: at most 30 a run, refreshed hourly, settled 48 hours after the start; an unlinked series is fetched once up to three days before its start, for its tournament id, on every run for six hours after its start (the list shows it live), hourly for the rest of its first day, and again once it is 24 hours old, so its game wins are final |
 
 The team rankings job upserts every completed match that is missing from the ledger,
 stored without both teams, a decisive score, or every played map, or contradicted by
@@ -54,7 +54,9 @@ which Sentry turns into an event. See
 [Broadcast tracker alerts](live-alerts.md) for both alert paths and the rule runbook.
 
 `RIOT_WEB_API_KEY` is the only switch for the Riot web overlays: **set, every Riot web
-feature runs; unset, no Riot web call is made** and the matching responses are VLR-only.
+feature runs; unset, no Riot web call is made** and the matching responses are VLR-only: the match
+list drops its Riot-only entries and every match is shown under its VLR id again, so unsetting it is
+the way to turn the feature off (a Riot id still opens its match).
 There are no feature flags, and `ENABLE_CACHE` is not needed for them: the cache
 wrappers no-op when caching is off, so the jobs still store what they fetch and the
 brackets route still answers from Riot.
@@ -85,6 +87,11 @@ it is cleared by hand:
 UPDATE riot_web_matches SET vlr_match_id = NULL, vlr_event_id = NULL
 WHERE riot_id = '<riot id>';
 ```
+
+Also clear the mirror on the VLR ledger row with
+`UPDATE matches SET riot_id = NULL WHERE riot_id = '<riot id>' AND id <> riot_id;` (the team rankings cron
+clears a mirror its link no longer backs anyway). A row whose `id` is the Riot id is the match clients
+know by that id: if the wrong VLR match adopted it, also set its `vlr_id` to NULL so the right one can.
 
 The next run may link it again from scratch. If a run logs `Riot and VLR times disagree for
 every name match`, at least three name pairs were found and none was inside two hours: the
@@ -121,6 +128,35 @@ curl -s -o /dev/null -w '%{http_code}\n' -H "x-api-key: $KEY" \
 (a valid key prints `200`; a rejected one prints `403`), then set `RIOT_WEB_API_KEY` in
 `~/val-esports-backend/.env` and restart the service. Removing `RIOT_WEB_API_KEY` disables
 the jobs and leaves every Riot-web field empty, and VLR responses are unaffected.
+
+### Riot-only matches in the ledger
+
+After its VLR upserts, `team_rankings_cron` runs `attach_riot_ids`, which clears a
+`matches.riot_id` mirror its link no longer backs, folds a VLR row into the Riot-only row of the same match when a series is linked after both were stored
+(the Riot row keeps its id and takes over VLR's values and maps, and the VLR row is deleted), and
+copies each linked series id onto its VLR row. It then stores every series the details cron fetched that no
+VLR match claimed (unlinked, 24 hours to three days after its start, no result stored yet) in its
+Riot-only `matches` row, whose id is the Riot series id. The schedule cron creates that row, empty,
+when the match list starts to show the series: an unlinked series within three days of now with two
+named teams (also on VLR's side: an entry VLR still shows with an undecided team holds the series
+back, so the match is not listed twice and then renamed) and a known Riot tournament (the row's event is that tournament's one VLR event, else the
+Riot-created event), unless a listed VLR match no other series is linked to has the same two teams within six
+hours. A result is stored
+only when both teams are mirrored to distinct VLR teams by Riot name (partner teams come from
+`scripts.mirror_team_logos`; any other Riot name, such as a Challengers team at a LAN, is first paired
+with the one unpaired VLR team whose name folds to the same letters and digits, and left alone when
+there are several), its stored game score is
+decisive and fetched after the series settled (an early fetch can hold a partial score), its
+tournament id is 11 to 20 digits, and no VLR match has the same two teams within a day. When VLR later lists the match without a stored link, `ingest_match` adopts the one Riot-only row of the same two teams that started within six hours of it and stores the missing link. A
+tournament that names exactly one VLR event ledgers the match under it; one that names several is
+skipped; one that names none is ledgered under a Riot-created event whose id is the tournament id
+(see [database.md](database.md)), written in the same transaction as its first match.
+`adopt_riot_events` runs in the `attach_riot_ids` transaction and moves a Riot-created
+event's matches to the VLR event its tournament has since been linked to. Anything missing is
+retried on the next run until the series leaves the window. Such a
+row has no maps and is rated on its series outcome only. When VLR lists the series later, the
+row is adopted: it keeps its id, gains `vlr_id`, and VLR's values and maps replace Riot's, so
+the series is rated once.
 
 ## Riot esports match archive
 

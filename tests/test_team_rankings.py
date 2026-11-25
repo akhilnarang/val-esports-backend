@@ -12,7 +12,7 @@ import openai
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -25,10 +25,10 @@ from app.core import connections
 from app.core.config import settings
 from app.cron.team_rankings import team_rankings_cron
 from app.db.migrations import upgrade_to_head
-from app.db.models import EventRecord, MapRecord, MatchRecord, RankingResult, Team, TeamCircuit, TeamElo
+from app.db.models import EventRecord, MapRecord, MatchRecord, RankingResult, RiotWebMatch, Team, TeamCircuit, TeamElo
 from app.schemas.matches import Agent, Event, MatchData, MatchVideos, Round, TeamMember, TeamWithImage
 from app.schemas.matches import Team as MapTeam
-from app.services import history, insights, matches, predictions, ranking_store, team_rankings
+from app.services import history, insights, matches, predictions, ranking_store, riot_web_store, team_rankings
 from app.services.ranking_store import StoredMap, StoredMatch
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
@@ -123,6 +123,7 @@ async def _seed_ledger(sessions, stored) -> None:
             session.add(
                 MatchRecord(
                     id=match_id,
+                    vlr_id=match_id,
                     event_id="10",
                     stage=None,
                     played_on=played_on,
@@ -294,6 +295,10 @@ def test_replay_assigns_region_from_recent_tiered_events():
     assert elos["5"]["region"] is Region.AMERICAS
 
 
+async def _by_vlr_id(session, vlr_id):
+    return await session.scalar(select(MatchRecord).where(MatchRecord.vlr_id == vlr_id))
+
+
 @pytest.mark.asyncio
 async def test_rebuild_ratings_is_order_independent(make_database):
     # The same ledger seeded newest-first and oldest-first must rate identically.
@@ -321,7 +326,7 @@ async def test_ingest_match_writes_ledger_and_rating_state(ranking_sessions, htt
     async with ranking_sessions() as session:
         teams = {team.id: team for team in (await session.execute(select(Team))).scalars()}
         assert (teams["1"].name, teams["1"].tag, teams["2"].name) == ("Team A", "A", "Team B")
-        match = await session.get(MatchRecord, "12345")
+        match = await _by_vlr_id(session, "12345")
         assert (match.played_on, match.stage, match.patch, match.source) == (date(2025, 10, 1), "Stage", "13.05", "vlr")
         assert (match.team_a_id, match.team_a_score, match.team_b_score) == ("1", 2, 1)
         maps = list((await session.execute(select(MapRecord).order_by(MapRecord.map_index))).scalars())
@@ -351,6 +356,137 @@ async def test_ingest_match_writes_ledger_and_rating_state(ranking_sessions, htt
         assert len(list((await session.execute(select(RankingResult))).scalars())) == 2
 
 
+EVENT_ID = "2283"
+
+
+TOURNAMENT_ID = "900000000000000000"
+
+
+def _riot_series(riot_id, names, wins, *, vlr_match_id=None, details=True, tournament_id=TOURNAMENT_ID):
+    return RiotWebMatch(
+        riot_id=riot_id,
+        start_time=datetime(2025, 10, 1, 12, tzinfo=UTC),
+        league_name="League",
+        best_of=3,
+        teams=[{"name": name} for name in names],
+        vlr_match_id=vlr_match_id,
+        vlr_event_id=EVENT_ID if vlr_match_id else None,
+        tournament_id=tournament_id,
+        details={"tournament_id": tournament_id, "game_wins": dict(zip(names, wins)), "games": []} if details else None,
+        details_fetched_at=datetime(2025, 10, 3, tzinfo=UTC),
+    )
+
+
+@pytest.mark.asyncio
+async def test_riot_only_series_is_rated_once_and_adopted_by_vlr(ranking_sessions, http_response):
+    """A series VLR never listed becomes one row under its Riot id, never a duplicate of a VLR match, and VLR adopts it later."""
+    details = await _details(http_response)
+    async with ranking_sessions.begin() as session:
+        await ranking_store.upsert_event(session, details.event.id, details.event.series, Circuit.VCT)
+        session.add_all(
+            Team(id=team_id, source="test", riot_name=name, first_seen_at=0, last_fetched_at=0)
+            for team_id, name in (("1", "Alpha"), ("2", "Beta"))
+        )
+        # A linked series names the VLR event of tournament 900; the unlinked ones are the candidates.
+        session.add(_riot_series("100", ["Other", "Another"], [2, 0], vlr_match_id="999"))
+        session.add(_riot_series("200", ["Alpha ", "Beta"], [2, 0]))
+        session.add(_riot_series("201", ["Alpha", "Unmirrored"], [2, 0]))
+        await session.flush()
+        # The match list already showed series 200, so its row exists and only lacks the result.
+        session.add(
+            MatchRecord(
+                id="200",
+                riot_id="200",
+                event_id=details.event.id,
+                played_on=date(2025, 10, 2),
+                source="riot_web",
+                ingested_at=0,
+            )
+        )
+    async with ranking_sessions() as session:
+        settled = {
+            row.riot_id: row
+            for row in await riot_web_store.settled_unlinked(session, datetime(2025, 10, 3, 13, tzinfo=UTC))
+        }
+    assert set(settled) == {"200", "201"}
+
+    async with ranking_sessions.begin() as session:
+        assert await team_rankings.ingest_riot_series(session, settled["200"]) is True
+        assert await team_rankings.ingest_riot_series(session, settled["201"]) is False
+        # Riot names a Game Changers roster like its main roster, so it is never rated onto that team.
+        game_changers = _riot_series("202", ["Alpha", "Beta"], [2, 0])
+        game_changers.league_name = "Game Changers Brazil"
+        assert await team_rankings.ingest_riot_series(session, game_changers) is False
+        # A best-of-three stopped at 1-0 is not a result.
+        assert await team_rankings.ingest_riot_series(session, _riot_series("203", ["Alpha", "Beta"], [1, 0])) is False
+        assert await team_rankings.ingest_riot_series(session, settled["200"]) is False
+    async with ranking_sessions.begin() as session:
+        await team_rankings.rebuild_ratings(session)
+    async with ranking_sessions() as session:
+        riot_only = (await session.execute(select(MatchRecord))).scalar_one()
+        assert (riot_only.id, riot_only.vlr_id, riot_only.riot_id, riot_only.source) == (
+            "200",
+            None,
+            "200",
+            "riot_web",
+        )
+        assert (riot_only.team_a_id, riot_only.team_a_score, riot_only.team_b_score) == ("1", 2, 0)
+        assert (await session.get(TeamElo, "1")).matches == 1
+        assert await ranking_store.stored_listings(session) == {}
+        # A result that moved the rating is part of the team's recent form, under its Riot id.
+        assert [recent.match.id for recent in await ranking_store.recent_results(session, "1", 5)] == ["200"]
+
+    # VLR lists the series later: its row is adopted, so the series is still rated once.
+    async with ranking_sessions.begin() as session:
+        await session.execute(
+            update(RiotWebMatch).where(RiotWebMatch.riot_id == "200").values(vlr_match_id="12345", vlr_event_id="10")
+        )
+    async with ranking_sessions.begin() as session:
+        assert await team_rankings.ingest_match(session, "12345", details, Circuit.VCT) is True
+    async with ranking_sessions.begin() as session:
+        await team_rankings.rebuild_ratings(session)
+    async with ranking_sessions() as session:
+        row = (await session.execute(select(MatchRecord))).scalar_one()
+        assert (row.id, row.vlr_id, row.riot_id, row.team_a_score, row.team_b_score) == ("200", "12345", "200", 2, 1)
+        assert [item.match_id for item in (await session.execute(select(MapRecord))).scalars()] == ["200"]
+        assert (await session.get(TeamElo, "1")).matches == 1
+
+    # A series that shares its teams and day with a VLR row inserts nothing.
+    async with ranking_sessions.begin() as session:
+        session.add(_riot_series("300", ["Alpha", "Beta"], [2, 1]))
+    async with ranking_sessions() as session:
+        series = await session.get(RiotWebMatch, "300")
+    async with ranking_sessions.begin() as session:
+        assert await team_rankings.ingest_riot_series(session, series) is False
+
+    # A tournament no VLR event is known for is ledgered under an event whose id is the tournament id. Its second
+    # team has no Riot name yet, so it is paired with the one VLR team of that name.
+    created = "800000000000000000"
+    async with ranking_sessions.begin() as session:
+        session.add_all(
+            Team(id=team_id, source="test", name=name, riot_name=riot_name, first_seen_at=0, last_fetched_at=0)
+            for team_id, name, riot_name in (("3", "Gamma", "Gamma"), ("4", "Delta Esports", None))
+        )
+        session.add(_riot_series("500", ["Gamma", "DELTA esports"], [2, 0], tournament_id=created))
+    async with ranking_sessions.begin() as session:
+        assert await team_rankings.ingest_riot_series(session, await session.get(RiotWebMatch, "500")) is True
+    async with ranking_sessions() as session:
+        event = await session.get(EventRecord, created)
+        assert (event.name, event.circuit, event.circuit_checked_at) == ("League", Circuit.OTHER, None)
+        assert (await session.scalar(select(MatchRecord.event_id).where(MatchRecord.riot_id == "500"))) == created
+        assert (await session.get(Team, "4")).riot_name == "DELTA esports"
+
+    # Once a VLR event is linked to that tournament, the Riot-created event's matches move to it, once.
+    async with ranking_sessions.begin() as session:
+        session.add(_riot_series("510", ["Other", "Another"], [2, 0], vlr_match_id="778", tournament_id=created))
+    async with ranking_sessions.begin() as session:
+        assert await ranking_store.adopt_riot_events(session) is True
+    async with ranking_sessions.begin() as session:
+        assert await ranking_store.adopt_riot_events(session) is False
+    async with ranking_sessions() as session:
+        assert (await session.scalar(select(MatchRecord.event_id).where(MatchRecord.riot_id == "500"))) == EVENT_ID
+
+
 @pytest.mark.asyncio
 async def test_ingest_match_repairs_an_incomplete_match_and_rebuilds_ratings(ranking_sessions, http_response):
     details = await _details(http_response)
@@ -359,6 +495,7 @@ async def test_ingest_match_repairs_an_incomplete_match_and_rebuilds_ratings(ran
         session.add(
             MatchRecord(
                 id="12345",
+                vlr_id="12345",
                 event_id=details.event.id,
                 stage=None,
                 played_on=date(2025, 10, 1),
@@ -415,7 +552,7 @@ async def test_ingest_match_repairs_an_incomplete_match_and_rebuilds_ratings(ran
         await team_rankings.rebuild_ratings(session)
 
     async with ranking_sessions() as session:
-        match = await session.get(MatchRecord, "12345")
+        match = await _by_vlr_id(session, "12345")
         assert (match.team_a_id, match.team_b_id, match.team_a_score, match.team_b_score) == ("1", "2", 2, 1)
         # The repair page carries the first map only; the partial fetch must keep the two stored maps.
         maps = list((await session.execute(select(MapRecord).order_by(MapRecord.map_index))).scalars())
@@ -470,6 +607,7 @@ async def test_team_rankings_cron_rebuilds_a_ledger_left_stale_by_a_crash(rankin
         session.add(
             MatchRecord(
                 id="12345",
+                vlr_id="12345",
                 event_id="10",
                 stage=None,
                 played_on=date(2025, 10, 1),
@@ -513,7 +651,7 @@ async def test_team_rankings_cron_rebuilds_a_ledger_left_stale_by_a_crash(rankin
     # A correction committed with the same row counts (the winner flipped) must still
     # rebuild: the counts alone cannot see it, only the stored outcomes can.
     async with ranking_sessions.begin() as session:
-        corrected = await session.get(MatchRecord, "12345")
+        corrected = await _by_vlr_id(session, "12345")
         corrected.team_a_score, corrected.team_b_score = 1, 2
     corrected_listing = listed.model_copy(
         update={
@@ -540,7 +678,7 @@ async def test_team_rankings_cron_rebuilds_a_ledger_left_stale_by_a_crash(rankin
     # A correction confined to one map leaves both the series winner and the counts
     # alone, so only the map outcomes can catch it.
     async with ranking_sessions.begin() as session:
-        first_map = await session.get(MapRecord, ("12345", 0))
+        first_map = await session.get(MapRecord, ((await _by_vlr_id(session, "12345")).id, 0))
         first_map.team_a_score, first_map.team_b_score = 7, 13
     async with ranking_sessions() as session:
         assert await ranking_store.needs_rebuild(session) is True
@@ -564,7 +702,7 @@ async def test_team_rankings_cron_rebuilds_a_ledger_left_stale_by_a_crash(rankin
 
     # Put the losing side on a sweep so swapping its ID below cannot move a winner.
     async with ranking_sessions.begin() as session:
-        last_map = await session.get(MapRecord, ("12345", 2))
+        last_map = await session.get(MapRecord, ((await _by_vlr_id(session, "12345")).id, 2))
         last_map.team_a_score, last_map.team_b_score = 9, 13
     async with ranking_sessions() as session:
         assert await ranking_store.needs_rebuild(session) is True
@@ -590,7 +728,7 @@ async def test_team_rankings_cron_rebuilds_a_ledger_left_stale_by_a_crash(rankin
     async with ranking_sessions.begin() as session:
         session.add(Team(id="3", source="test", first_seen_at=0, last_fetched_at=0))
         await session.flush()
-        losing_side = await session.get(MatchRecord, "12345")
+        losing_side = await _by_vlr_id(session, "12345")
         losing_side.team_a_id = "3"
     corrected_listing = corrected_listing.model_copy(
         update={"team1": corrected_listing.team1.model_copy(update={"id": "3", "name": "Team C"})}
@@ -625,7 +763,7 @@ async def test_team_rankings_cron_rebuilds_a_ledger_left_stale_by_a_crash(rankin
     # A correction to the date alone leaves the counts, winners, and participants alone;
     # only the stored dates catch it, and the rebuild moves the ledger rows with it.
     async with ranking_sessions.begin() as session:
-        moved = await session.get(MatchRecord, "12345")
+        moved = await _by_vlr_id(session, "12345")
         moved.played_on = date(2025, 10, 3)
     async with ranking_sessions() as session:
         assert await ranking_store.needs_rebuild(session) is True
@@ -802,7 +940,7 @@ def test_rankings_api_serves_lists_profiles_and_predictions(monkeypatch, ranking
     async def clear_patches():
         async with ranking_sessions.begin() as session:
             for match_id in DETAIL_MATCH_IDS:
-                (await session.get(MatchRecord, match_id)).patch = None
+                (await _by_vlr_id(session, match_id)).patch = None
 
     asyncio.run(clear_patches())
     unpatched = client.get("/api/v2/rankings/predict", params={"team_a": "1", "team_b": "2"})
@@ -893,6 +1031,7 @@ def test_rankings_api_filters_and_ranks_by_region(monkeypatch, ranking_sessions)
                     session.add(
                         MatchRecord(
                             id=f"{event_id}{index}",
+                            vlr_id=f"{event_id}{index}",
                             event_id=event_id,
                             stage=None,
                             played_on=date(2025, 10, 1),
@@ -1011,6 +1150,7 @@ async def _seed_history(sessions) -> None:
             session.add(
                 MatchRecord(
                     id=match_id,
+                    vlr_id=match_id,
                     event_id="10",
                     played_on=played_on,
                     team_a_id=team_a_id,
@@ -1319,3 +1459,73 @@ async def test_final_match_summary_is_stored_once_and_a_failure_cools_down(monke
         ("Player 10", "team_a", 50, 1.5),
         ("Player 20", "team_b", 24, 0.8),
     ]
+
+
+@pytest.mark.asyncio
+async def test_vlr_match_adopts_the_riot_only_row_of_the_same_teams_even_when_no_link_was_stored(
+    ranking_sessions, http_response
+):
+    """A series Riot-only ingest stored first is not rated a second time when VLR lists it without a stored link."""
+    details = await _details(http_response)
+    async with ranking_sessions.begin() as session:
+        await ranking_store.upsert_event(session, details.event.id, details.event.series, Circuit.VCT)
+        session.add_all(Team(id=team_id, source="test", first_seen_at=0, last_fetched_at=0) for team_id in ("1", "2"))
+        await session.flush()
+        session.add(
+            RiotWebMatch(
+                riot_id="200",
+                start_time=details.event.date,
+                league_name="League",
+                teams=[{"name": "Beta"}, {"name": "Alpha"}],
+            )
+        )
+        await session.flush()
+        session.add(
+            MatchRecord(
+                id="200",
+                riot_id="200",
+                event_id=details.event.id,
+                played_on=details.event.date.date(),
+                team_a_id="2",
+                team_b_id="1",
+                team_a_score=1,
+                team_b_score=2,
+                source="riot_web",
+                ingested_at=0,
+            )
+        )
+    async with ranking_sessions.begin() as session:
+        assert await team_rankings.ingest_match(session, "12345", details, Circuit.VCT) is True
+    async with ranking_sessions() as session:
+        row = (await session.execute(select(MatchRecord))).scalar_one()
+        assert (row.id, row.vlr_id, row.riot_id) == ("200", "12345", "200")
+    # The link the cron missed is stored, so mirroring the ids afterwards keeps the series id on the row.
+    async with ranking_sessions.begin() as session:
+        await ranking_store.attach_riot_ids(session)
+    async with ranking_sessions() as session:
+        assert (await session.scalar(select(MatchRecord.riot_id))) == "200"
+
+    # VLR's own row existed before the link: the row clients know, the Riot one, takes over its values and maps.
+    async with ranking_sessions.begin() as session:
+        session.add(
+            RiotWebMatch(
+                riot_id="201", start_time=details.event.date, league_name="League", teams=[], vlr_match_id="777"
+            )
+        )
+        session.add_all(
+            MatchRecord(
+                id=row_id, event_id=details.event.id, played_on=details.event.date.date(), ingested_at=0, **fields
+            )
+            for row_id, fields in (
+                ("201", {"riot_id": "201", "source": "riot_web"}),
+                ("777", {"vlr_id": "777", "team_a_id": "1", "team_b_id": "2", "team_a_score": 2, "source": "vlr"}),
+            )
+        )
+        await session.flush()
+        session.add(MapRecord(match_id="777", map_index=0, name="Bind", team_a_score=13, team_b_score=5))
+    async with ranking_sessions.begin() as session:
+        assert await ranking_store.attach_riot_ids(session) is True
+    async with ranking_sessions() as session:
+        rows = (await session.execute(select(MatchRecord.id, MatchRecord.vlr_id, MatchRecord.team_a_score))).all()
+        assert sorted(rows) == [("200", "12345", 2), ("201", "777", 2)]
+        assert (await session.scalar(select(MapRecord.match_id).where(MapRecord.name == "Bind"))) == "201"

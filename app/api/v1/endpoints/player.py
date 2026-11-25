@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Query
 
 from app import schemas
-from app.services import player
+from app.services import match_refs, player
 
 router = APIRouter()
 
@@ -16,4 +16,6 @@ async def get_player_by_id(
         Query(description="Pages of match history to include (50 per page); <= 0 fetches all."),
     ] = 1,
 ) -> schemas.Player:
-    return await player.get_player_data(player_id, match_pages=match_pages)
+    data = await player.get_player_data(player_id, match_pages=match_pages)
+    await match_refs.keep_ids(data.matches)
+    return data
